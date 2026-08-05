@@ -436,6 +436,41 @@ await checkAsync("a filename containing shell metacharacters is not executed by 
 // The engine says a hook is not a way around an imported deny rule. That has to
 // hold for this path too, or a host that denies a command at the front door
 // still runs it whenever a file is written.
+await checkAsync("a post-edit check runs the shell CLC_SHELL names", async () => {
+  resetHooks();
+  const dir = path.join(tmp, "shell-override");
+  await fs.mkdir(dir, { recursive: true });
+  const target = path.join(dir, "ok.ts");
+  await fs.writeFile(target, "const x = 1;\n", "utf-8");
+
+  const hooksConfig = path.join(tmp, "shell-override-post-edit.json");
+  await fs.writeFile(
+    hooksConfig,
+    JSON.stringify({
+      enabled: true,
+      hooks: [{ glob: "*.ts", command: 'node --check "{path}"', timeout_ms: 10000 }],
+    }),
+    "utf-8"
+  );
+  process.env.POST_EDIT_HOOKS_CONFIG = hooksConfig;
+
+  // A shell that cannot exist: honoured, the check cannot start; ignored, the
+  // file is valid TypeScript and the check passes.
+  const original = process.env.CLC_SHELL;
+  process.env.CLC_SHELL = path.join(dir, "no-such-shell");
+  try {
+    const out = await runPostEditHooks([target]);
+    const report = out.post_edit_hooks[0];
+    assert(report.exit_code !== 0, `the check ran under some other shell (exit ${report.exit_code})`);
+    assert(/spawn failed/.test(report.stderr ?? ""), `unexpected stderr: ${report.stderr}`);
+  } finally {
+    if (original === undefined) delete process.env.CLC_SHELL;
+    else process.env.CLC_SHELL = original;
+    delete process.env.POST_EDIT_HOOKS_CONFIG;
+    clearInternalHooks();
+  }
+});
+
 await checkAsync("an imported deny rule stops a post-edit check", async () => {
   resetHooks();
   const dir = path.join(tmp, "denied");

@@ -81,6 +81,28 @@ try {
 } catch (e) { fail("defaultShell", e.message); }
 
 try {
+  const original = process.env.CLC_SHELL;
+  try {
+    process.env.CLC_SHELL = "/bin/sh";
+    const posix = defaultShell();
+    if (posix.command !== "/bin/sh") throw new Error(`CLC_SHELL ignored: got ${posix.command}`);
+    if (posix.kind !== "posix") throw new Error(`/bin/sh reported as ${posix.kind}`);
+    if (posix.args("echo hi").join(" ") !== "-lc echo hi") throw new Error("wrong POSIX argv");
+
+    // The override decides the convention, not the platform: `pwsh` is invoked
+    // as PowerShell wherever it is installed, Linux and macOS included.
+    process.env.CLC_SHELL = "/opt/microsoft/powershell/7/pwsh";
+    const ps = defaultShell();
+    if (ps.kind !== "powershell") throw new Error(`pwsh reported as ${ps.kind}`);
+    if (!ps.args("echo hi").includes("-NoProfile")) throw new Error("wrong PowerShell argv");
+  } finally {
+    if (original === undefined) delete process.env.CLC_SHELL;
+    else process.env.CLC_SHELL = original;
+  }
+  ok("CLC_SHELL overrides the shell and the argument convention it is invoked with");
+} catch (e) { fail("CLC_SHELL override", e.message); }
+
+try {
   const opts = detachedSpawnOptions();
   if (typeof opts.detached !== "boolean" || typeof opts.windowsHide !== "boolean") {
     throw new Error("detachedSpawnOptions shape wrong");

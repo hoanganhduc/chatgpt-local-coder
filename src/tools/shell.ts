@@ -4,6 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
 import { requireCommandAllowed } from "../lib/permissions.js";
 import { audit } from "../lib/audit.js";
+import { defaultShell } from "../lib/platform.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 import {
@@ -114,9 +115,8 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     async ({ command, working_directory }) => {
       requireCommandAllowed(command);
       const cwd = working_directory ? await validatePath(working_directory, "read") : getShellStatus().cwd || defaultCwd;
-      const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-      const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
-      const child = spawn(shell, args, { cwd, windowsHide: true, env: process.env });
+      const shell = defaultShell();
+      const child = spawn(shell.command, shell.args(command), { cwd, windowsHide: true, env: process.env });
       const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const item: ManagedProcess = {
         id,

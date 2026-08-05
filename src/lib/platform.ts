@@ -18,6 +18,13 @@ export interface ShellSpec {
   args: (script: string) => string[];
   /** Human label used in diagnostics. */
   label: string;
+  /**
+   * Which language the script is written in. `CLC_SHELL` unties this from the
+   * platform — a `pwsh` on Linux and a `bash` on Windows are both reachable —
+   * so a caller that builds a script rather than passing one through has to ask
+   * the shell rather than assume from the OS.
+   */
+  kind: "posix" | "powershell";
 }
 
 export function platformId(): PlatformId {
@@ -99,11 +106,15 @@ function powershellArgs(script: string): string[] {
 }
 
 /**
- * Shell selection order:
+ * The shell every part of this host runs a command through — `run_command`,
+ * `start_process`, hooks and post-edit checks alike. Selection order:
  *   1. CLC_SHELL override (absolute path or bare name)
  *   2. Windows: pwsh, else powershell
  *   3. macOS: $SHELL if zsh/bash/sh, else /bin/zsh
  *   4. Linux: $SHELL if bash/zsh/sh, else /bin/sh
+ *
+ * Skills are the exception, and deliberately: a skill declares the runtime it
+ * needs, so one that says `bash` gets bash whatever this returns.
  */
 export function defaultShell(): ShellSpec {
   const override = (process.env.CLC_SHELL || "").trim();
@@ -113,13 +124,14 @@ export function defaultShell(): ShellSpec {
       command: override,
       args: isPowerShell ? powershellArgs : posixShellArgs,
       label: path.basename(override),
+      kind: isPowerShell ? "powershell" : "posix",
     };
   }
 
   if (isWindows()) {
     const pwsh = onPath("pwsh");
     const command = pwsh || "powershell.exe";
-    return { command, args: powershellArgs, label: pwsh ? "pwsh" : "powershell" };
+    return { command, args: powershellArgs, label: pwsh ? "pwsh" : "powershell", kind: "powershell" };
   }
 
   const envShell = (process.env.SHELL || "").trim();
@@ -128,11 +140,11 @@ export function defaultShell(): ShellSpec {
     platformId() === "darwin" ? ["zsh", "bash", "sh"] : ["bash", "zsh", "sh"];
 
   if (envShell && acceptable.includes(envBase)) {
-    return { command: envShell, args: posixShellArgs, label: envBase };
+    return { command: envShell, args: posixShellArgs, label: envBase, kind: "posix" };
   }
 
   const fallback = platformId() === "darwin" ? "/bin/zsh" : "/bin/sh";
-  return { command: fallback, args: posixShellArgs, label: path.basename(fallback) };
+  return { command: fallback, args: posixShellArgs, label: path.basename(fallback), kind: "posix" };
 }
 
 /** Spawn options that make a child killable as a whole process tree. */

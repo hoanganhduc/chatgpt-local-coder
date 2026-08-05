@@ -14,7 +14,7 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { registerInternalHook } from "../hooks/engine.js";
 import { requireCommandAllowed } from "./permissions.js";
-import { detachedSpawnOptions, killProcessTree, trackChild } from "./platform.js";
+import { defaultShell, detachedSpawnOptions, killProcessTree, trackChild } from "./platform.js";
 
 export interface PostEditHook {
   glob: string;
@@ -78,8 +78,10 @@ function runHook(
   filePath: string,
   timeoutMs: number
 ): Promise<{ stdout: string; stderr: string; exit_code: number | null; error?: string }> {
-  const isWindows = process.platform === "win32";
-  const reference = isWindows ? `$env:${HOOK_PATH_VAR}` : `$${HOOK_PATH_VAR}`;
+  // Which expansion syntax the reference is written in follows the shell, not
+  // the platform: `CLC_SHELL` can name a pwsh on Linux or a bash on Windows.
+  const shell = defaultShell();
+  const reference = shell.kind === "powershell" ? `$env:${HOOK_PATH_VAR}` : `$${HOOK_PATH_VAR}`;
   const expanded = command.replace(/\{path\}/g, reference).replace(/\{file\}/g, reference);
 
   try {
@@ -100,11 +102,8 @@ function runHook(
     });
   }
 
-  const shell = isWindows ? "powershell.exe" : "bash";
-  const args = isWindows ? ["-NoProfile", "-Command", expanded] : ["-lc", expanded];
-
   return new Promise((resolve) => {
-    const child = spawn(shell, args, {
+    const child = spawn(shell.command, shell.args(expanded), {
       cwd: path.dirname(filePath),
       env: { ...process.env, [HOOK_PATH_VAR]: filePath },
       // Detached, so the kill below reaches the whole tree and not just the

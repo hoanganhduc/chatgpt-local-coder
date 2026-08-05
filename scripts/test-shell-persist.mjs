@@ -111,6 +111,31 @@ try {
   ok("a command that leaves something running still returns when it exits");
 } catch (e) { fail("run_command background process", e.message || e); }
 
+try {
+  // Naming a shell that cannot exist is the one probe that works on every OS:
+  // if the override is honoured the spawn fails and says which path it tried,
+  // and if it is ignored the command simply runs.
+  const missing = path.join(fixtureDir, "no-such-shell");
+  const original = process.env.CLC_SHELL;
+  process.env.CLC_SHELL = missing;
+
+  let error;
+  try {
+    await execInShellSession("echo hi", root, 15000);
+  } catch (e) {
+    error = e;
+  } finally {
+    if (original === undefined) delete process.env.CLC_SHELL;
+    else process.env.CLC_SHELL = original;
+  }
+
+  if (!error) throw new Error("the command ran anyway, so CLC_SHELL was ignored");
+  if (!String(error.message).includes("no-such-shell")) {
+    throw new Error(`failed for some other reason: ${error.message}`);
+  }
+  ok("run_command runs the shell CLC_SHELL names");
+} catch (e) { fail("run_command honours CLC_SHELL", e.message || e); }
+
 await fs.rm(fixtureDir, { recursive: true, force: true });
 await fs.rm(stateDir, { recursive: true, force: true });
 console.log(`\n${passed} passed, ${failed} failed`);

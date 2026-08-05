@@ -119,7 +119,12 @@ Tasks are ordered. Each names its files, its interface, and its acceptance test.
 
 ```ts
 export type PlatformId = "win32" | "darwin" | "linux";
-export interface ShellSpec { command: string; args: (script: string) => string[]; label: string; }
+export interface ShellSpec {
+  command: string;
+  args: (script: string) => string[];
+  label: string;
+  kind: "posix" | "powershell";   // which language the script is written in
+}
 
 export function platformId(): PlatformId;
 export function archId(): "amd64" | "arm64";
@@ -138,6 +143,9 @@ Shell selection order:
    `["-lc", script]`.
 4. Linux: `$SHELL` if it ends in `bash`/`zsh`/`sh`, else `/bin/sh`, args
    `["-lc", script]`.
+
+This is the shell for `run_command`, `start_process`, hooks and post-edit
+checks. Skills are not covered: a skill declares its own `runtime`.
 
 `killProcessTree` uses `taskkill /PID <pid> /T /F` on Windows and
 `process.kill(-pgid)` after `spawn(..., { detached: true })` elsewhere.

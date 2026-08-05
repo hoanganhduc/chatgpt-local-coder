@@ -37,7 +37,8 @@ the user config for that workspace.
 
 ## 2. Shell selection
 
-`run_command` and skill execution use one shell per OS, chosen in this order:
+`run_command`, `start_process`, hooks and post-edit checks all run through one
+shell per OS, chosen in this order:
 
 1. `CLC_SHELL`, if set — an absolute path or a bare name. A basename matching
    `pwsh` or `powershell` is invoked with PowerShell argument conventions;
@@ -48,6 +49,24 @@ the user config for that workspace.
 4. **Linux:** `$SHELL` when it is `bash`, `zsh` or `sh`; otherwise `/bin/sh`.
 
 POSIX shells are invoked as `-lc <script>`.
+
+Note what step 1 does to steps 2–4: the override decides the argument
+convention as well as the executable, so a `pwsh` named on Linux is invoked as
+PowerShell and a `bash` named on Windows as a POSIX shell. Anything that builds
+a script rather than passing one through asks the shell which language it is —
+the post-edit check that passes the edited path as `$CLC_HOOK_PATH` writes
+`$env:CLC_HOOK_PATH` instead when the shell is a PowerShell, whatever the OS.
+
+Skills are the exception, and deliberately. A skill declares the `runtime` it
+needs — `node`, `python`, `bash`, `powershell` — and gets that interpreter;
+`CLC_SHELL` does not redirect it, because a skill written for `bash` is not a
+script `sh` can run.
+
+The practical consequence for `run_command` on POSIX: it follows `$SHELL` like
+everything else here rather than always being `bash`. On a host whose `$SHELL`
+is something this host does not recognise the fallback is `/bin/sh`, so a
+command written with bashisms needs `CLC_SHELL=/bin/bash` or an explicit
+`bash -c`.
 
 The practical consequence: a command you write for one host is not portable to
 the other two. `rm -rf build` works on macOS and Linux; the Windows equivalent

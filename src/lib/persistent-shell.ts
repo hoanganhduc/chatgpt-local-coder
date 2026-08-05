@@ -1,5 +1,5 @@
 import path from "path";
-import { runExecutable } from "./platform.js";
+import { defaultShell, runExecutable } from "./platform.js";
 
 export interface ShellExecResult {
   command: string;
@@ -125,16 +125,14 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
  * that leads it.
  */
 async function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
-  const isWindows = process.platform === "win32";
-  const shell = isWindows ? "powershell.exe" : "bash";
-  const args = isWindows ? ["-NoProfile", "-Command", command] : ["-lc", command];
+  const shell = defaultShell();
 
   // Closed at once. Spawning gives the child a pipe nobody here ever writes to,
   // so a command that reads stdin waits on it for the whole timeout instead of
   // seeing the EOF a non-interactive shell should give it.
-  const result = await runExecutable(shell, args, { cwd, timeoutMs, stdin: "" });
+  const result = await runExecutable(shell.command, shell.args(command), { cwd, timeoutMs, stdin: "" });
 
-  if (result.spawnFailed) throw new Error(result.stderr || `failed to start ${shell}`);
+  if (result.spawnFailed) throw new Error(result.stderr || `failed to start ${shell.command}`);
   if (result.timedOut) throw new Error(`Command timed out after ${timeoutMs / 1000}s`);
 
   return {
