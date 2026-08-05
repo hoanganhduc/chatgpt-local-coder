@@ -13,6 +13,7 @@ import path from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { registerInternalHook } from "../hooks/engine.js";
+import { requireCommandAllowed } from "./permissions.js";
 import { killProcessTree } from "./platform.js";
 
 export interface PostEditHook {
@@ -51,13 +52,60 @@ async function loadHooksConfig(): Promise<HooksConfig> {
   }
 }
 
-function runHook(command: string, filePath: string, timeoutMs: number): Promise<{ stdout: string; stderr: string; exit_code: number | null }> {
-  const expanded = command.replace(/\{path\}/g, filePath).replace(/\{file\}/g, filePath);
-  const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-  const args = process.platform === "win32" ? ["-NoProfile", "-Command", expanded] : ["-lc", expanded];
+/**
+ * The name the edited path is passed under. The path is handed to the shell as
+ * an environment variable and `{path}` expands to a *reference* to it, so the
+ * path itself is never part of the command text.
+ *
+ * This is what keeps a filename from becoming code. Neither a POSIX shell nor
+ * PowerShell re-scans the result of a parameter expansion for metacharacters,
+ * so a file named `inj$(touch owned).ts` expands to that literal string instead
+ * of running anything — in the bare and the double-quoted form alike. Quoting
+ * the path into the command text cannot achieve the same thing: the shipped
+ * config writes `"{path}"`, and no escaping is correct for both a quoted and an
+ * unquoted template.
+ *
+ * The one behavioural cost is that a template using the bare form (`lint
+ * {path}`) word-splits a path containing spaces, where `"{path}"` does not.
+ */
+const HOOK_PATH_VAR = "CLC_HOOK_PATH";
+
+function runHook(
+  command: string,
+  filePath: string,
+  timeoutMs: number
+): Promise<{ stdout: string; stderr: string; exit_code: number | null; error?: string }> {
+  const isWindows = process.platform === "win32";
+  const reference = isWindows ? `$env:${HOOK_PATH_VAR}` : `$${HOOK_PATH_VAR}`;
+  const expanded = command.replace(/\{path\}/g, reference).replace(/\{file\}/g, reference);
+
+  try {
+    // The same gate `runCommandHook` applies in the hooks engine. Without it a
+    // model holding only `write_file` runs, on every edit, a command that
+    // `run_command` would refuse — so an imported deny rule would hold at the
+    // front door and not here. Checked against the expanded text because that
+    // is what reaches the shell.
+    requireCommandAllowed(expanded);
+  } catch (error) {
+    // A refused check has not run, so it has not judged the file. Reported the
+    // way the engine reports one, rather than as a failure of the edit.
+    return Promise.resolve({
+      stdout: "",
+      stderr: "",
+      exit_code: null,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+
+  const shell = isWindows ? "powershell.exe" : "bash";
+  const args = isWindows ? ["-NoProfile", "-Command", expanded] : ["-lc", expanded];
 
   return new Promise((resolve) => {
-    const child = spawn(shell, args, { cwd: path.dirname(filePath), windowsHide: true });
+    const child = spawn(shell, args, {
+      cwd: path.dirname(filePath),
+      env: { ...process.env, [HOOK_PATH_VAR]: filePath },
+      windowsHide: true,
+    });
     let stdout = "";
     let stderr = "";
 
@@ -119,6 +167,7 @@ export async function runPostEditHooks(filePaths: string[]): Promise<Record<stri
         exit_code: out.exit_code,
         stdout: out.stdout.slice(0, 2000),
         stderr: out.stderr.slice(0, 2000),
+        ...(out.error ? { error: out.error } : {}),
       });
     }
   }

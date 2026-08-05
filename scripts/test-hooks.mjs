@@ -21,7 +21,7 @@ import { matchesTool, resetMatcherCache } from "../dist/hooks/matchers.js";
 import { applyHookWrapper } from "../dist/hooks/wrap.js";
 import { registerPostEditHook, runPostEditHooks } from "../dist/lib/post-edit-hooks.js";
 import { toolResult } from "../dist/lib/tool-result.js";
-import { setPermissionContext } from "../dist/lib/permissions.js";
+import { setImportedRuleCheck, setPermissionContext } from "../dist/lib/permissions.js";
 import { setDefaultCwd } from "../dist/lib/path-security.js";
 
 let passed = 0;
@@ -52,6 +52,10 @@ const sleepCmd = isWindows ? "Start-Sleep -Seconds 5" : "sleep 5";
 // makes the trap fire promptly: a POSIX shell defers a trap until the current
 // foreground command returns, so a bare `sleep 5` would swallow the signal.
 const trappedSleepCmd = isWindows ? "Start-Sleep -Seconds 5" : 'trap "exit 3" TERM; sleep 5 & wait';
+/** Creates `MARKER.txt` in the shell's cwd. Used as an injection payload. */
+const markerCmd = isWindows ? "Set-Content MARKER.txt x" : "touch MARKER.txt";
+/** The same, under a name an imported deny rule below matches on. */
+const deniedCmd = isWindows ? "Set-Content DENIED.txt x" : "touch DENIED.txt";
 
 /** A minimal stand-in for McpServer that records what was registered. */
 function fakeServer() {
@@ -390,6 +394,78 @@ await checkAsync("a post-edit check that overruns its timeout is reported and le
     // which on Windows is what left the fixture unremovable.
     assert(elapsed < 20_000, `should return near its 1s timeout, not run to completion: ${elapsed}ms`);
   } finally {
+    delete process.env.POST_EDIT_HOOKS_CONFIG;
+    clearInternalHooks();
+  }
+});
+
+// A hook command is operator-configured, but the path substituted into it is
+// not: a model chooses the name of the file it writes. `$(...)` expands inside
+// the double quotes the shipped config puts around `{path}` — in a POSIX shell
+// and in PowerShell alike — and every character in the payload below is legal
+// in a filename on both, so one `write_file` is the whole attack.
+await checkAsync("a filename containing shell metacharacters is not executed by a post-edit check", async () => {
+  resetHooks();
+  const dir = path.join(tmp, "inject");
+  await fs.mkdir(dir, { recursive: true });
+  const target = path.join(dir, `inj$(${markerCmd}).ts`);
+  await fs.writeFile(target, "const x = 1;\n", "utf-8");
+
+  const hooksConfig = path.join(tmp, "inject-post-edit.json");
+  await fs.writeFile(
+    hooksConfig,
+    // The shipped `profiles/post-edit-hooks.json` shape, verbatim.
+    JSON.stringify({
+      enabled: true,
+      hooks: [{ glob: "*.ts", command: 'node --check "{path}"', timeout_ms: 10000 }],
+    }),
+    "utf-8"
+  );
+  process.env.POST_EDIT_HOOKS_CONFIG = hooksConfig;
+
+  try {
+    await runPostEditHooks([target]);
+    const ran = await fs.access(path.join(dir, "MARKER.txt")).then(() => true, () => false);
+    assert(!ran, "the filename was executed as a shell command");
+  } finally {
+    delete process.env.POST_EDIT_HOOKS_CONFIG;
+    clearInternalHooks();
+  }
+});
+
+// The engine says a hook is not a way around an imported deny rule. That has to
+// hold for this path too, or a host that denies a command at the front door
+// still runs it whenever a file is written.
+await checkAsync("an imported deny rule stops a post-edit check", async () => {
+  resetHooks();
+  const dir = path.join(tmp, "denied");
+  await fs.mkdir(dir, { recursive: true });
+  const target = path.join(dir, "sample.ts");
+  await fs.writeFile(target, "const x = 1;\n", "utf-8");
+
+  const hooksConfig = path.join(tmp, "denied-post-edit.json");
+  await fs.writeFile(
+    hooksConfig,
+    JSON.stringify({ enabled: true, hooks: [{ glob: "*.ts", command: deniedCmd, timeout_ms: 10000 }] }),
+    "utf-8"
+  );
+  process.env.POST_EDIT_HOOKS_CONFIG = hooksConfig;
+  setImportedRuleCheck((tool, argument) =>
+    tool === "run_command" && argument.includes("DENIED.txt")
+      ? { decision: "deny", rule: "Bash(touch *)" }
+      : null
+  );
+
+  try {
+    const out = await runPostEditHooks([target]);
+    const report = out.post_edit_hooks[0];
+    assert(/Permission denied/.test(report.error ?? ""), `reported as denied: ${JSON.stringify(report)}`);
+    // Refused is not failed: a check that never ran has not judged the file.
+    assert(report.exit_code === null, `exit_code: ${report.exit_code}`);
+    const ran = await fs.access(path.join(dir, "DENIED.txt")).then(() => true, () => false);
+    assert(!ran, "the denied command ran anyway");
+  } finally {
+    setImportedRuleCheck(null);
     delete process.env.POST_EDIT_HOOKS_CONFIG;
     clearInternalHooks();
   }
