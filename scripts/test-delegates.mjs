@@ -33,7 +33,11 @@ function check(name, fn) {
 }
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 
-const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-delegates-"));
+// Canonicalised once: on macOS os.tmpdir() sits under /var, a symlink to
+// /private/var, and on POSIX a spawned child reports the resolved form from
+// process.cwd() (getcwd(3) never consults $PWD), so a lexical fixture root can
+// never match what the stub sees.
+const tmp = await fs.realpath(await fs.mkdtemp(path.join(os.tmpdir(), "clc-delegates-")));
 const stubDir = path.join(tmp, "bin");
 const work = path.join(tmp, "work");
 await fs.mkdir(stubDir, { recursive: true });
@@ -50,6 +54,10 @@ await fs.writeFile(
     // No process.exit here: exiting mid-write would truncate the pipe itself,
     // and then the cap under test would never be reached.
     "else if (mode === 'flood') { process.stdout.write('x'.repeat(400 * 1024)); }",
+    // The pause lets the parent drain exactly the cap before more arrives, so
+    // the boundary case is hit on every platform rather than only where the OS
+    // happens to split the stream on a multiple of the cap.
+    "else if (mode === 'boundary') { process.stdout.write('x'.repeat(200 * 1024)); setTimeout(() => process.stdout.write('y'.repeat(1024)), 50); }",
     "else if (mode === 'fail') { process.stderr.write('stub refused'); process.exit(3); }",
     "else { process.stdout.write(JSON.stringify({ name: process.env.STUB_NAME, argv, cwd: process.cwd() })); process.exit(0); }",
   ].join("\n"),
@@ -228,6 +236,18 @@ await checkAsync("output beyond the cap is truncated and flagged", async () => {
       Buffer.byteLength(result.output) <= MAX_DELEGATE_OUTPUT_BYTES,
       `output bytes: ${Buffer.byteLength(result.output)}`
     );
+  } finally {
+    delete process.env.STUB_MODE;
+  }
+});
+
+await checkAsync("truncation is still flagged when the capture lands exactly on the cap", async () => {
+  resetDelegateProbe();
+  process.env.STUB_MODE = "boundary";
+  try {
+    const result = await runDelegate({ prompt: "hi", agent: "codex", timeoutSec: 30 });
+    assert(result.ok === true, "ran");
+    assert(result.truncated === true, "truncation flagged at the boundary");
   } finally {
     delete process.env.STUB_MODE;
   }

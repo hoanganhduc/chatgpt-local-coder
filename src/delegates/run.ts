@@ -114,7 +114,14 @@ export async function runDelegate(opts: DelegateRunOptions): Promise<DelegateRun
   const result = await runExecutable(chosen.path, args, {
     cwd,
     timeoutMs: (opts.timeoutSec ?? 300) * 1000,
-    maxOutputBytes: MAX_DELEGATE_OUTPUT_BYTES,
+    // One byte past the ceiling on purpose: `cap()` decides truncation by
+    // comparing the captured text against MAX_DELEGATE_OUTPUT_BYTES, so the
+    // capture has to be able to exceed it. Stopping the capture exactly at the
+    // ceiling makes the flag depend on where the OS splits the stream — child
+    // stdio is a unix socketpair, and its buffer is 212992 bytes on Linux but
+    // reportedly 8192 on macOS (net.local.stream.sendspace), where 200 KiB is a
+    // whole number of reads.
+    maxOutputBytes: MAX_DELEGATE_OUTPUT_BYTES + 1,
   });
 
   const stdout = cap(result.stdout);

@@ -43,11 +43,33 @@ export function pathsAreCaseInsensitive(): boolean {
   return platformId() !== "linux";
 }
 
+/**
+ * Names to try for `binary` on Windows, in order. A name that already ends in a
+ * PATHEXT extension is a complete executable name and must be tried as written;
+ * PATHEXT is only ever appended, so "node.exe" is looked up as "node.exe" and
+ * not as "node.exe.exe".
+ */
+function windowsCandidates(binary: string): string[] {
+  const parseExts = (raw: string): string[] =>
+    raw
+      .split(";")
+      .map((ext) => ext.trim().toLowerCase())
+      .filter(Boolean)
+      .map((ext) => (ext.startsWith(".") ? ext : `.${ext}`));
+
+  const fromEnv = parseExts(process.env.PATHEXT || "");
+  const exts = fromEnv.length ? fromEnv : parseExts(".EXE;.CMD;.BAT");
+  const appended = exts.map((ext) => binary + ext);
+
+  return exts.includes(path.extname(binary).toLowerCase()) ? [binary, ...appended] : appended;
+}
+
 function onPath(binary: string): string | undefined {
   const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
-  const candidates = isWindows()
-    ? (process.env.PATHEXT || ".EXE;.CMD;.BAT").split(";").map((ext) => binary + ext.toLowerCase())
-    : [binary];
+  // fs.constants.X_OK "has no effect on Windows (will behave like
+  // fs.constants.F_OK)", so on Windows it is the extension list, not the access
+  // check, that decides whether a match is executable.
+  const candidates = isWindows() ? windowsCandidates(binary) : [binary];
 
   for (const dir of dirs) {
     for (const candidate of candidates) {

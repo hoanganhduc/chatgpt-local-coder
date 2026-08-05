@@ -4,6 +4,7 @@
 
 **A provider-neutral local coding host over MCP — files, shell, git, patches, skills, delegates.**
 
+[![CI](https://github.com/hoanganhduc/chatgpt-local-coder/actions/workflows/ci.yml/badge.svg)](https://github.com/hoanganhduc/chatgpt-local-coder/actions/workflows/ci.yml)
 [![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-6366f1?style=flat-square)](https://modelcontextprotocol.io)
 [![ChatGPT](https://img.shields.io/badge/ChatGPT-Developer%20Mode-10a37f?style=flat-square)](https://platform.openai.com/docs/guides/developer-mode)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178c6?style=flat-square)](https://www.typescriptlang.org/)

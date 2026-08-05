@@ -67,6 +67,31 @@ roots on Linux.
 Workspace roots are resolved to absolute paths and de-duplicated at load time.
 Relative paths passed to tools resolve against the first workspace root.
 
+### Symlinked system directories on macOS
+
+macOS resolves `/tmp`, `/var` and `/etc` to `/private/tmp`, `/private/var` and
+`/private/etc`. `os.tmpdir()` therefore returns a path under `/var/folders/…`
+while a process started there reports `/private/var/folders/…` from
+`process.cwd()`, because `getcwd(3)` returns the canonical form.
+
+The two forms are the same directory, and the permission engine treats them as
+such: it resolves both the target and the roots before deciding. But a *lexical*
+comparison of the two strings fails. Anything comparing paths for equality — a
+test fixture, a cache key — has to canonicalise first. Linux has no equivalent,
+so this is invisible until it reaches a macOS runner.
+
+### Executable lookup on Windows
+
+`which()` follows Windows rules rather than POSIX ones. A bare name is tried
+with each `PATHEXT` extension appended, so `which("node")` finds `node.exe`; a
+name that already carries a `PATHEXT` extension is tried as written first, so
+`which("node.exe")` finds `node.exe` and not `node.exe.exe`.
+
+The access check cannot carry the weight it does on POSIX:
+`fs.constants.X_OK` "has no effect on Windows (will behave like
+`fs.constants.F_OK`)", so it is the extension list, not the file mode, that
+decides whether a match counts as executable.
+
 ---
 
 ## 4. Background service
