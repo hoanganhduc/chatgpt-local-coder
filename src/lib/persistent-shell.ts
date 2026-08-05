@@ -1,5 +1,5 @@
-import { spawn } from "child_process";
 import path from "path";
+import { runExecutable } from "./platform.js";
 
 export interface ShellExecResult {
   command: string;
@@ -8,6 +8,8 @@ export interface ShellExecResult {
   stderr: string;
   exit_code: number | null;
   timed_out: boolean;
+  /** Set when the command printed more than the host will hold. */
+  truncated?: boolean;
 }
 
 import { loadGlobalShellState, saveGlobalShellState } from "./global-shell-state.js";
@@ -109,42 +111,41 @@ export function applyCwdDirectives(currentCwd: string, command: string): { cwd: 
   return { cwd, command: rest || "pwd" };
 }
 
-function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
-  return new Promise((resolve, reject) => {
-    const shell = process.platform === "win32" ? "powershell.exe" : "bash";
-    const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
-    const child = spawn(shell, args, { cwd, windowsHide: true, env: process.env });
-    let stdout = "";
-    let stderr = "";
-    let timedOut = false;
+/**
+ * Run one command through a shell.
+ *
+ * The spawn goes through `runExecutable` rather than being written out again
+ * here, which is what gives this tool the bounds the rest of the host already
+ * had. Three of them matter: output is capped, where this used to append every
+ * byte a command produced until the string passed V8's maximum length and the
+ * append threw inside a stream listener, ending the server; the run settles when
+ * the shell exits rather than when its pipes close, where `run_command "npm run
+ * dev &"` used to leave the call pending for as long as the background process
+ * lived; and a timeout now kills the whole process tree instead of the shell
+ * that leads it.
+ */
+async function runOnce(command: string, cwd: string, timeoutMs: number): Promise<ShellExecResult> {
+  const isWindows = process.platform === "win32";
+  const shell = isWindows ? "powershell.exe" : "bash";
+  const args = isWindows ? ["-NoProfile", "-Command", command] : ["-lc", command];
 
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill();
-    }, timeoutMs);
+  // Closed at once. Spawning gives the child a pipe nobody here ever writes to,
+  // so a command that reads stdin waits on it for the whole timeout instead of
+  // seeing the EOF a non-interactive shell should give it.
+  const result = await runExecutable(shell, args, { cwd, timeoutMs, stdin: "" });
 
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) {
-        reject(new Error(`Command timed out after ${timeoutMs / 1000}s`));
-        return;
-      }
-      resolve({
-        command,
-        cwd,
-        stdout: stdout.trim(),
-        stderr: stderr.trim(),
-        exit_code: code,
-        timed_out: false,
-      });
-    });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(err);
-    });
-  });
+  if (result.spawnFailed) throw new Error(result.stderr || `failed to start ${shell}`);
+  if (result.timedOut) throw new Error(`Command timed out after ${timeoutMs / 1000}s`);
+
+  return {
+    command,
+    cwd,
+    stdout: result.stdout,
+    stderr: result.stderr,
+    exit_code: result.exitCode,
+    timed_out: false,
+    truncated: result.truncated,
+  };
 }
 
 export async function execInShellSession(

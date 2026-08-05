@@ -257,6 +257,12 @@ export interface RunResult {
    * batch defect report a delegation that never happened as a success.
    */
   spawnFailed?: boolean;
+  /**
+   * Set when output passed `maxOutputBytes` and the rest was dropped. A reader
+   * that cannot tell a complete result from a clipped one draws conclusions
+   * from output it does not have.
+   */
+  truncated?: boolean;
 }
 
 /**
@@ -473,8 +479,8 @@ export function runExecutable(
       return;
     }
 
-    let stdout = "";
-    let stderr = "";
+    const captured = { stdout: "", stderr: "" };
+    const dropped = { stdout: false, stderr: false };
     let timedOut = false;
     let settled = false;
     let drainTimer: NodeJS.Timeout | undefined;
@@ -485,13 +491,27 @@ export function runExecutable(
       void killProcessTree(child.pid ?? 0);
     }, timeoutMs);
 
+    /** What was kept, and a note where the rest used to be. */
+    const bounded = (key: "stdout" | "stderr"): string => {
+      const text = captured[key].trim();
+      if (!dropped[key]) return text;
+      return `${text}\n[output truncated at ${maxOutput} bytes]`;
+    };
+
     const finish = (exitCode: number | null, spawnFailed = false) => {
       if (settled) return;
       settled = true;
       untrack();
       clearTimeout(timer);
       if (drainTimer) clearTimeout(drainTimer);
-      resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode, timedOut, spawnFailed });
+      resolve({
+        stdout: bounded("stdout"),
+        stderr: bounded("stderr"),
+        exitCode,
+        timedOut,
+        spawnFailed,
+        truncated: dropped.stdout || dropped.stderr,
+      });
     };
 
     if (opts.stdin !== undefined) {
@@ -501,17 +521,29 @@ export function runExecutable(
       child.stdin?.end(opts.stdin);
     }
 
-    child.stdout?.on("data", (chunk: Buffer) => {
-      if (stdout.length < maxOutput) stdout += chunk.toString();
-    });
-    child.stderr?.on("data", (chunk: Buffer) => {
-      if (stderr.length < maxOutput) stderr += chunk.toString();
-    });
+    /**
+     * Keep up to `maxOutput` and drop the rest, without ever stopping reading:
+     * a stream left unread fills its pipe and blocks the writer, so a command
+     * that printed too much would hang rather than be truncated. Past the cap a
+     * chunk is dropped whole rather than sliced, which is also what keeps a
+     * multi-byte character from being cut in half at the boundary — so the kept
+     * text can overshoot by one chunk, and does so deliberately.
+     */
+    const capture = (key: "stdout" | "stderr") => (chunk: Buffer) => {
+      if (captured[key].length >= maxOutput) {
+        dropped[key] = true;
+        return;
+      }
+      captured[key] += chunk.toString();
+    };
+
+    child.stdout?.on("data", capture("stdout"));
+    child.stderr?.on("data", capture("stderr"));
     child.on("error", (error) => {
       // POSIX reports a missing or non-executable target here rather than by
       // throwing from spawn, so this is the same "never started" outcome the
       // synchronous catch above handles.
-      stderr += (stderr ? "\n" : "") + error.message;
+      captured.stderr += (captured.stderr ? "\n" : "") + error.message;
       finish(null, true);
     });
     child.on("exit", (code) => {

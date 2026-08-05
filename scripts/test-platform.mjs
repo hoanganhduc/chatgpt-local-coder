@@ -108,6 +108,27 @@ try {
 } catch (e) { fail("runExecutable missing binary", e.message); }
 
 try {
+  // Ten megabytes against a thousand-byte cap. Nothing here reads the output;
+  // the point is that a command cannot make this host hold all of it, since
+  // past V8's maximum string length the append throws inside a stream listener
+  // where nothing catches it and the process leaves.
+  const result = await runExecutable(
+    process.execPath,
+    ["-e", "const chunk = 'x'.repeat(1024 * 64); for (let i = 0; i < 160; i++) process.stdout.write(chunk);"],
+    { timeoutMs: 30000, maxOutputBytes: 1000 }
+  );
+  if (result.exitCode !== 0) throw new Error(`exit ${result.exitCode}: ${result.stderr}`);
+  // One chunk of overshoot is expected: a chunk that arrives under the cap is
+  // taken whole rather than cut, so a multi-byte character cannot be halved.
+  if (result.stdout.length > 200_000) {
+    throw new Error(`kept ${result.stdout.length} chars against a 1000-byte cap`);
+  }
+  if (result.truncated !== true) throw new Error("output was dropped without saying so");
+  if (!/truncated/.test(result.stdout)) throw new Error("nothing in the output says it is incomplete");
+  ok("runExecutable bounds what it captures and reports what it dropped");
+} catch (e) { fail("runExecutable output cap", e.message); }
+
+try {
   const shell = defaultShell();
   const result = await runExecutable(shell.command, shell.args("exit 7"), { timeoutMs: 30000 });
   if (result.exitCode !== 7) throw new Error(`exit ${result.exitCode}`);

@@ -70,6 +70,9 @@ async function loadHooksConfig(): Promise<HooksConfig> {
  */
 const HOOK_PATH_VAR = "CLC_HOOK_PATH";
 
+/** How much of a check's output is held while it runs. The report keeps 2000. */
+const MAX_HOOK_OUTPUT = 100_000;
+
 function runHook(
   command: string,
   filePath: string,
@@ -134,8 +137,17 @@ function runHook(
       });
     }, timeoutMs);
 
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
+    // Bounded well above the 2000 characters the report keeps, and far below
+    // what a string can hold: a checker that prints without limit would
+    // otherwise be appended to until the append itself threw, inside a stream
+    // listener where nothing catches it. Still read after the cap, since a
+    // stream left unread fills its pipe and blocks the checker on it.
+    child.stdout.on("data", (d: Buffer) => {
+      if (stdout.length < MAX_HOOK_OUTPUT) stdout += d.toString();
+    });
+    child.stderr.on("data", (d: Buffer) => {
+      if (stderr.length < MAX_HOOK_OUTPUT) stderr += d.toString();
+    });
     child.on("close", (code) => {
       clearTimeout(timer);
       // The kill itself closes the child, and that fires here first. Reporting
