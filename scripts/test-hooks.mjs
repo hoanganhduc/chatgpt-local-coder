@@ -45,6 +45,13 @@ const isWindows = process.platform === "win32";
 const okCmd = isWindows ? "exit 0" : "exit 0";
 const failCmd = isWindows ? "Write-Error 'nope'; exit 1" : "echo nope 1>&2; exit 1";
 const sleepCmd = isWindows ? "Start-Sleep -Seconds 5" : "sleep 5";
+// A slow hook that reports a numeric non-zero exit code when it is killed,
+// rather than the "no exit code at all" a SIGKILLed POSIX child reports. That
+// is what Windows does natively — it has no signals, and `taskkill /F` exits 1
+// — so on POSIX the shape has to be built with a TERM trap. `wait` is what
+// makes the trap fire promptly: a POSIX shell defers a trap until the current
+// foreground command returns, so a bare `sleep 5` would swallow the signal.
+const trappedSleepCmd = isWindows ? "Start-Sleep -Seconds 5" : 'trap "exit 3" TERM; sleep 5 & wait';
 
 /** A minimal stand-in for McpServer that records what was registered. */
 function fakeServer() {
@@ -219,6 +226,31 @@ await checkAsync("a hook that overruns its own timeout is killed and does not bl
   assert(elapsed < HOOK_BUDGET_MS, `elapsed ${elapsed}ms should stay well under the ${HOOK_BUDGET_MS}ms budget`);
   assert(report.results.length === 2, `both hooks ran: ${report.results.length}`);
   assert(report.results.every((r) => r.timedOut), `results: ${JSON.stringify(report.results)}`);
+});
+
+await checkAsync("a hook killed on timeout does not block even when the kill leaves a non-zero exit code", async () => {
+  resetHooks();
+  // Whether a killed hook reports an exit code is the platform's choice, not a
+  // decision the hook made. Windows has no signals: `taskkill /F` exits 1, so a
+  // hook that was merely slow arrived here looking exactly like one that
+  // deliberately refused, and blocked the tool call. Inferring "was killed"
+  // from a null exit code only ever held on POSIX.
+  setHookConfig({
+    enabled: true,
+    matchers: {
+      PreToolUse: [
+        { matcher: "*", hooks: [{ type: "command", command: trappedSleepCmd, timeoutSec: 1 }] },
+      ],
+    },
+  });
+
+  const report = await runHooks({ event: "PreToolUse", tool: "write_file" });
+  const [result] = report.results;
+  assert(result.timedOut === true, `the hook should have been killed: ${JSON.stringify(result)}`);
+  assert(typeof result.exitCode === "number" && result.exitCode !== 0,
+    `this test is only meaningful if the kill leaves a non-zero exit code: ${JSON.stringify(result)}`);
+  assert(!report.blocked, `a killed hook decided nothing, so it must not block: ${JSON.stringify(report.blocked)}`);
+  assert(!result.blocked, `result should not be marked as a block: ${JSON.stringify(result)}`);
 });
 
 // ------------------------------------------------------------------- tool wrapper

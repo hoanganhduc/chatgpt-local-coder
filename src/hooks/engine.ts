@@ -246,9 +246,16 @@ export async function runHooks(ctx: HookContext): Promise<HookReport> {
       const result = await runCommandHook(action.command, timeoutMs, ctx);
       result.matcher = entry.matcher;
 
-      // A hook that never ran — forbidden by the profile, or killed on timeout —
-      // has not decided anything, so only a real non-zero exit blocks.
-      const failed = typeof result.exitCode === "number" && result.exitCode !== 0;
+      // A hook that never ran — forbidden by the profile, killed on timeout, or
+      // never spawned — has not decided anything, so only a real non-zero exit
+      // blocks. `timedOut` has to be consulted explicitly rather than inferred
+      // from a null exit code: that inference holds only on POSIX, where a
+      // SIGKILLed child reports no code at all. Windows has no signals, and
+      // `taskkill /F` sets exit code 1, so on Windows a hook that was merely
+      // slow used to be indistinguishable from one that deliberately refused —
+      // and blocked the call. A forbidden or unspawnable hook still reaches
+      // here as a null exit code, which the typeof guard rejects.
+      const failed = !result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0;
       if (ctx.event === "PreToolUse" && failed) {
         result.blocked = true;
         report.results.push(result);

@@ -162,6 +162,17 @@ being a syscall that consults no `PATH`. If `taskkill` fails anyway the host
 falls back to terminating the process itself, which does not reach its children
 but is not nothing.
 
+What a killed process reports differs too, and one place cared. A `PreToolUse`
+hook blocks the call by exiting non-zero, and a hook killed for overrunning its
+timeout has decided nothing and must not block. POSIX makes that easy to get
+wrong: a `SIGKILL`ed child reports no exit code at all, so "was killed" reads
+straight off a null exit code. Windows has no signals, `taskkill /F` sets exit
+code 1, and a hook that was merely slow became indistinguishable from one that
+deliberately refused — so it blocked the tool call. `runHooks` now consults
+`timedOut` explicitly rather than inferring it. The regression test builds the
+Windows shape on POSIX with a `TERM` trap, so it fails on every OS rather than
+only the one where it bites.
+
 ---
 
 ## 4. Background service
