@@ -168,7 +168,7 @@ The negative pid `killProcessTree` signals is a process group, and a child only
 leads one if it was spawned `detached`. That spawn flag was written but never
 applied, so the kill fell through to the direct child and the descendants it had
 started kept running. The cost was larger than a leaked process: `runExecutable`
-settles on `close`, which waits for the stdio pipes as well as the process, and a
+settled on `close` then, which waits for the stdio pipes as well as the process, and a
 surviving descendant holds the inherited stdout open. A command whose children
 outlived it left the promise pending — the timeout was a flag rather than a
 bound, and a `PreToolUse` hook could stall a tool call past `HOOK_BUDGET_MS`
@@ -185,11 +185,27 @@ hand rather than left off. The regression test drives a real process group rathe
 than signalling a single pid, since signalling the host alone never reached the
 child either way and would prove nothing.
 
-Two shapes still outlive this. A descendant that calls `setsid` itself leaves the
-group deliberately, and a launcher that daemonises and exits 0 is never killed at
-all because nothing timed out. Both would need `runExecutable` to settle on
-`exit` with a separate deadline for draining stdio, which is a wider change than
-the spawn flag.
+### When a run settles
+
+Killing the group bounds what a timeout can reach, not when a run answers. Two
+shapes escaped it: a descendant that calls `setsid` itself leaves the group
+deliberately, and a launcher that daemonises and exits 0 is never killed at all
+because nothing timed out. Both hold the stdout they inherited, and both left a
+run that waited for `close` pending indefinitely.
+
+A run therefore settles on `exit` — the process is gone and its exit code is
+known — with the pipes given a further two seconds to drain. Nothing else holds
+them in the ordinary case, so they end with the process and that deadline is
+cleared without firing. When it does fire the read ends are left open and merely
+`unref`'d: destroying them would hand the survivor an `EPIPE` on its next write,
+and a daemon a launcher deliberately left behind should not die of the way this
+host stopped watching it. They keep draining so a chatty survivor cannot fill a
+pipe and block on it.
+
+The consequence worth stating plainly: a command that exits 0 while leaving
+something running now reports exit 0 promptly rather than being killed at its
+timeout, because nothing timed out. That is what a launcher is for. A command
+that has not exited is still killed by the timeout, group and all.
 
 What a killed process reports differs too, and one place cared. A `PreToolUse`
 hook blocks the call by exiting non-zero, and a hook killed for overrunning its

@@ -393,6 +393,21 @@ export function windowsBatchInvocation(
 }
 
 /**
+ * How long the stdio pipes are given once the process itself is gone.
+ *
+ * `close` fires when the pipes end, not when the process does, and a command
+ * that leaves something running hands that something the very pipe it was
+ * given — so `close` can be minutes away or never come at all. Waiting for it
+ * is what made a run unbounded: a launcher that daemonises and exits 0 has
+ * nothing left to time out, and a descendant that calls `setsid` is outside the
+ * group the timeout kills.
+ *
+ * Two seconds is far longer than a pipe with no other writer needs — it ends as
+ * soon as the process does — and short enough that a leaked one is not a hang.
+ */
+const STDIO_DRAIN_MS = 2_000;
+
+/**
  * Run an executable directly (no shell). Used for probing CLIs and for
  * tunnel/service management where argv must not be re-parsed by a shell.
  *
@@ -462,6 +477,7 @@ export function runExecutable(
     let stderr = "";
     let timedOut = false;
     let settled = false;
+    let drainTimer: NodeJS.Timeout | undefined;
     const untrack = trackChild(child.pid);
 
     const timer = setTimeout(() => {
@@ -474,6 +490,7 @@ export function runExecutable(
       settled = true;
       untrack();
       clearTimeout(timer);
+      if (drainTimer) clearTimeout(drainTimer);
       resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode, timedOut, spawnFailed });
     };
 
@@ -497,6 +514,25 @@ export function runExecutable(
       stderr += (stderr ? "\n" : "") + error.message;
       finish(null, true);
     });
+    child.on("exit", (code) => {
+      // The process this host started is gone, and its exit code is already
+      // known. Only the pipes are still open, so what remains is a question of
+      // how long to keep reading them — not of whether this run has an answer.
+      drainTimer = setTimeout(() => {
+        // Left open and merely unref'd rather than destroyed: closing the read
+        // end hands whatever still holds the write end an EPIPE on its next
+        // write, and a daemon a launcher deliberately left behind should not
+        // die of the way this host stopped watching it. Unref'd so it cannot
+        // keep this process alive, and still drained so it cannot fill and
+        // block the writer either.
+        for (const stream of [child.stdout, child.stderr]) {
+          (stream as unknown as { unref?: () => void } | null)?.unref?.();
+        }
+        finish(code);
+      }, STDIO_DRAIN_MS);
+    });
+    // The ordinary path: nothing else holds the pipes, so they end with the
+    // process and the drain deadline above is cleared without ever firing.
     child.on("close", (code) => finish(code));
   });
 }

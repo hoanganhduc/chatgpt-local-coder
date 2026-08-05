@@ -147,14 +147,14 @@ try {
   ok("a child that overruns its timeout is killed even when PATH is empty");
 } catch (e) { fail("timeout kill without PATH", e.message); }
 
-// ------------------------------------------------------- killing a whole tree
+// ------------------------------------- when a run settles, and what it killed
 //
-// A timeout is only a bound if it reaches everything the command started.
-// `runExecutable` settles on `close`, which waits for the stdio pipes as well
-// as the process, so a descendant holding the inherited stdout keeps the
-// promise pending for as long as it runs — the timeout stops being a limit and
-// becomes a flag. The fixtures below are written in Node rather than shell so
-// the same tree exists on every supported OS.
+// A timeout is only a bound if it reaches everything the command started, and a
+// run is only bounded at all if it can settle. Waiting for `close` waits for the
+// stdio pipes as well as the process, so anything the command leaves running
+// holds the inherited stdout open and keeps the promise pending for as long as
+// it lives. The fixtures below are written in Node rather than shell so the same
+// tree exists on every supported OS.
 
 const treeDir = await fsp.mkdtemp(path.join(os.tmpdir(), "clc-tree-"));
 const spawner = path.join(treeDir, "spawner.mjs");
@@ -163,15 +163,32 @@ await fsp.writeFile(
   [
     'import { spawn } from "child_process";',
     'import fs from "fs";',
-    "const [, , pidFile, mode] = process.argv;",
-    "// `inherit` hands the descendant the very pipe this process was given.",
-    'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 25000)"], { stdio: "inherit" });',
-    "fs.writeFileSync(pidFile, String(child.pid));",
-    "// `orphan` leaves at once, so the descendant reparents to init long before",
-    "// the timeout — a tree walked from the child pid would find nothing, while",
-    "// the process group it stays in still reaches it.",
-    'if (mode === "orphan") { child.unref(); process.exit(0); }',
-    "setTimeout(() => {}, 25000);",
+    "const [, self, pidFile, mode] = process.argv;",
+    "",
+    "// `inherit` hands the next process the very pipe this one was given, so the",
+    "// pipe outlives whoever started it.",
+    "const spawnSelf = (next, opts) =>",
+    '  spawn(process.execPath, [self, pidFile, next], { stdio: "inherit", ...opts });',
+    "",
+    "// The long-lived process every case below is really about.",
+    'if (mode === "leaf") { fs.writeFileSync(pidFile, String(process.pid)); setTimeout(() => {}, 25000); }',
+    "",
+    "// Stays alive itself, so the run times out with the leaf still under it.",
+    'else if (mode === "hold") { spawnSelf("leaf"); setTimeout(() => {}, 25000); }',
+    "",
+    "// Also stays alive, but the leaf is started one level down by a process that",
+    "// leaves at once — so the leaf reparents to init long before the timeout. A",
+    "// tree walked from this pid would no longer find it; the process group it",
+    "// stays in still reaches it.",
+    'else if (mode === "reparent") { spawnSelf("daemon"); setTimeout(() => {}, 25000); }',
+    "",
+    "// Daemonises: leaves the leaf running and exits 0 straight away, the shape a",
+    "// launcher takes. Nothing has timed out, so nothing should be killed.",
+    'else if (mode === "daemon") { spawnSelf("leaf").unref(); process.exit(0); }',
+    "",
+    "// `detached` is setsid: the leaf leads a process group of its own, so the",
+    "// group kill cannot reach it and it holds the pipe open through the timeout.",
+    'else if (mode === "escape") { spawnSelf("leaf", { detached: true }).unref(); setTimeout(() => {}, 25000); }',
   ].join("\n"),
   "utf-8"
 );
@@ -180,46 +197,75 @@ function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-async function runTreeCase(mode) {
+async function runTreeCase(mode, { timeoutMs = 1000, settleBy = 10000, hangAfter = 20000 } = {}) {
   const pidFile = path.join(treeDir, `${mode}.pid`);
   const started = Date.now();
-  const pending = runExecutable(process.execPath, [spawner, pidFile, mode], { timeoutMs: 1000 });
+  const pending = runExecutable(process.execPath, [spawner, pidFile, mode], { timeoutMs });
   const outcome = await Promise.race([
     pending.then((result) => ({ result })),
-    new Promise((resolve) => setTimeout(() => resolve(null), 15000)),
+    new Promise((resolve) => setTimeout(() => resolve(null), hangAfter)),
   ]);
   const elapsed = Date.now() - started;
-  const descendant = Number(await fsp.readFile(pidFile, "utf-8").catch(() => "0"));
+  const leaf = Number(await fsp.readFile(pidFile, "utf-8").catch(() => "0"));
   // Whatever the verdict, do not leave a 25s process behind for the next test.
-  const cleanup = () => { if (descendant) { try { process.kill(descendant, "SIGKILL"); } catch { /* gone */ } } };
+  const cleanup = () => { if (leaf) { try { process.kill(leaf, "SIGKILL"); } catch { /* gone */ } } };
 
   if (!outcome) {
     cleanup();
     throw new Error(`never settled: a descendant held the stdout pipe for the full ${elapsed}ms`);
   }
-  if (!descendant) { cleanup(); throw new Error("fixture never recorded a descendant pid"); }
-  if (elapsed > 10000) { cleanup(); throw new Error(`settled far past its 1s timeout: ${elapsed}ms`); }
+  if (!leaf) { cleanup(); throw new Error("fixture never recorded a leaf pid"); }
+  if (elapsed > settleBy) { cleanup(); throw new Error(`settled ${elapsed}ms after a ${timeoutMs}ms timeout`); }
+  return { result: outcome.result, elapsed, leaf, cleanup };
+}
 
-  // The kill is signalled, not awaited by runExecutable, so allow it a moment.
-  for (let attempt = 0; attempt < 20 && isAlive(descendant); attempt++) {
+/** The kill is signalled, not awaited by `runExecutable`, so allow it a moment. */
+async function reaped(leaf) {
+  for (let attempt = 0; attempt < 20 && isAlive(leaf); attempt++) {
     await new Promise((resolve) => setTimeout(resolve, 100));
   }
-  const survived = isAlive(descendant);
-  cleanup();
-  if (survived) throw new Error(`descendant ${descendant} outlived the timeout that killed its parent`);
-  return outcome.result;
+  return !isAlive(leaf);
 }
 
 try {
-  const result = await runTreeCase("hold");
+  const { result, leaf, cleanup } = await runTreeCase("hold");
+  const gone = await reaped(leaf);
+  cleanup();
   if (result.timedOut !== true) throw new Error("timeout not flagged");
+  if (!gone) throw new Error(`leaf ${leaf} outlived the timeout that killed its parent`);
   ok("a timed-out command is killed along with the descendants it started");
 } catch (e) { fail("timeout kills the tree", e.message); }
 
 try {
-  await runTreeCase("orphan");
+  const { leaf, cleanup } = await runTreeCase("reparent");
+  const gone = await reaped(leaf);
+  cleanup();
+  if (!gone) throw new Error(`reparented leaf ${leaf} outlived the timeout`);
   ok("a descendant already reparented to init is still reached by the timeout");
 } catch (e) { fail("timeout kills a reparented descendant", e.message); }
+
+try {
+  // Ten seconds of timeout against a command that exits in one: the run has to
+  // settle because the process is gone, not because a limit was hit.
+  const { result, elapsed, leaf, cleanup } = await runTreeCase("daemon", {
+    timeoutMs: 10000,
+    settleBy: 8000,
+  });
+  const survived = isAlive(leaf);
+  cleanup();
+  if (result.timedOut === true) throw new Error(`a command that exited in ${elapsed}ms was reported as timed out`);
+  if (result.exitCode !== 0) throw new Error(`exit ${result.exitCode}, expected the launcher's own 0`);
+  if (!survived) throw new Error(`the daemon this launcher deliberately left behind was killed anyway`);
+  ok("a launcher that daemonises and exits settles at once, and its daemon is left alone");
+} catch (e) { fail("daemonising launcher", e.message); }
+
+try {
+  const { result, leaf, cleanup } = await runTreeCase("escape");
+  cleanup();
+  if (result.timedOut !== true) throw new Error("timeout not flagged");
+  if (!leaf) throw new Error("fixture never recorded a leaf pid");
+  ok("a descendant that leaves the process group cannot keep a timed-out run pending");
+} catch (e) { fail("descendant outside the group", e.message); }
 
 await fsp.rm(treeDir, { recursive: true, force: true });
 
