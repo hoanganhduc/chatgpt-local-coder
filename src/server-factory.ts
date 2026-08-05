@@ -6,6 +6,10 @@ import { registerGitTools } from "./tools/git.js";
 import { registerContextTools } from "./tools/context.js";
 import { registerRewindTools } from "./tools/rewind.js";
 import { registerMcpBridgeTools } from "./tools/mcp-bridge.js";
+import { registerSkillTools, type SkillToolOptions } from "./tools/skills.js";
+import { registerSettingsTools } from "./tools/settings.js";
+import { registerDelegateTools, type DelegateToolOptions } from "./tools/delegate.js";
+import { applyHookWrapper } from "./hooks/wrap.js";
 import { buildServerInstructions } from "./lib/quickstart.js";
 import type { McpUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { refreshProxiedTools } from "./lib/mcp-tool-proxy.js";
@@ -37,7 +41,13 @@ export function createMcpServer(
   workspaceRoots: string[] = [workspaceRoot],
   fullDiskAccess = false,
   upstreamManager?: McpUpstreamManager,
-  projectMemoryInstructions?: string
+  projectMemoryInstructions?: string,
+  skillOptions: SkillToolOptions = { allowExecution: true, maxRuntimeSec: 300 },
+  delegateOptions: DelegateToolOptions = {
+    enabled: true,
+    order: ["claude", "codex", "opencode", "grok"],
+    timeoutSec: 300,
+  }
 ): McpServer {
   const server = new McpServer(
     {
@@ -59,12 +69,18 @@ export function createMcpServer(
   );
 
   applyToolProfile(server);
+  // Wrapped after the profile filter so a tool the profile hides never gets a
+  // hook wrapper it will not use.
+  applyHookWrapper(server);
 
   registerFilesystemTools(server);
   registerShellTools(server, workspaceRoot, shellTimeout);
   registerGitTools(server, workspaceRoot);
   registerContextTools(server, workspaceRoot);
   registerRewindTools(server);
+  registerSkillTools(server, skillOptions);
+  registerSettingsTools(server);
+  registerDelegateTools(server, delegateOptions);
 
   if (upstreamManager) {
     registerMcpBridgeTools(server, upstreamManager);

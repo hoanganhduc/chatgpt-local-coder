@@ -11,7 +11,12 @@ import {
   type ProjectMemoryBundle,
 } from "./project-memory.js";
 import { appendAutoMemory, formatAutoMemoryForInstructions, loadAutoMemory } from "./auto-memory.js";
-import { formatSkillsForInstructions, loadProjectSkills } from "./skills-loader.js";
+import {
+  formatSkillsForInstructions,
+  getSkillRegistry,
+  isSkillRegistryLoaded,
+  loadSkillRegistry,
+} from "../skills/registry.js";
 import { getChatGptToolProfile } from "./tool-profile.js";
 import { buildServerInstructions } from "./quickstart.js";
 
@@ -20,6 +25,8 @@ export interface InstructionContextOptions {
   workspaceRoots: string[];
   pid: number;
   adminPort: number;
+  /** Whether the active profile permits writes outside the workspace roots. */
+  fullDiskAccess: boolean;
 }
 
 export interface InstructionContext {
@@ -32,10 +39,15 @@ export interface InstructionContext {
 export async function buildInstructionContext(
   opts: InstructionContextOptions
 ): Promise<InstructionContext> {
-  const [projectMemory, git, skills, autoMemory] = await Promise.all([
+  // The registry is normally loaded once at startup; load it here when a caller
+  // builds instructions without having gone through that path.
+  const registry = isSkillRegistryLoaded()
+    ? getSkillRegistry()
+    : await loadSkillRegistry({ workspaceRoots: opts.workspaceRoots });
+
+  const [projectMemory, git, autoMemory] = await Promise.all([
     loadProjectMemory(opts.workspaceRoot, { workspaceRoots: opts.workspaceRoots }),
     collectGitSnapshot(opts.workspaceRoot),
-    loadProjectSkills(opts.workspaceRoot),
     loadAutoMemory(opts.workspaceRoot),
   ]);
 
@@ -54,14 +66,14 @@ export async function buildInstructionContext(
     formatGitSnapshotForInstructions(git),
     formatAutoMemoryForInstructions(autoMemory),
     formatProjectMemoryForInstructions(projectMemory),
-    formatSkillsForInstructions(skills),
+    formatSkillsForInstructions(registry.skills),
   ].filter(Boolean);
 
   const projectMemoryBlock = blocks.join("\n\n");
   const instructionsText = buildServerInstructions(
     opts.workspaceRoot,
     opts.workspaceRoots,
-    true,
+    opts.fullDiskAccess,
     projectMemoryBlock
   );
 

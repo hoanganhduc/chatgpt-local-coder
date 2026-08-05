@@ -54,17 +54,39 @@ console.log("=== Build ===");
 await runBuild();
 
 const unitScripts = [
+  "scripts/test-platform.mjs",
+  "scripts/test-config.mjs",
+  "scripts/test-secrets.mjs",
+  "scripts/test-permissions.mjs",
+  "scripts/test-skills.mjs",
+  "scripts/test-settings.mjs",
+  "scripts/test-delegates.mjs",
+  "scripts/test-hooks.mjs",
+  "scripts/test-tunnel.mjs",
+  "scripts/test-services.mjs",
+  "scripts/test-cli.mjs",
   "scripts/test-patch.mjs",
   "scripts/test-tools.mjs",
   "scripts/test-checkpoints.mjs",
   "scripts/test-activity-log.mjs",
   "scripts/test-project-memory.mjs",
   "scripts/test-tool-profile.mjs",
+  "scripts/test-instructions.mjs",
   "scripts/test-shell-persist.mjs",
 ];
 
 console.log("\n=== Unit tests ===");
 for (const script of unitScripts) {
+  console.log(`\n--- ${script} ---`);
+  await runNode(script);
+}
+
+// These spawn their own servers on their own ports, so they run before the
+// shared integration server below.
+const serverScripts = ["scripts/test-bind.mjs", "scripts/test-permissions-e2e.mjs"];
+
+console.log("\n=== Server-level tests (self-hosted) ===");
+for (const script of serverScripts) {
   console.log(`\n--- ${script} ---`);
   await runNode(script);
 }

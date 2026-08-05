@@ -2,166 +2,251 @@
 
 # ChatGPT Local Coder
 
-**Turn ChatGPT web into a local coding agent — files, shell, git, patches, 40+ MCP tools.**
+**A provider-neutral local coding host over MCP — files, shell, git, patches, skills, delegates.**
 
 [![MCP](https://img.shields.io/badge/MCP-Streamable%20HTTP-6366f1?style=flat-square)](https://modelcontextprotocol.io)
 [![ChatGPT](https://img.shields.io/badge/ChatGPT-Developer%20Mode-10a37f?style=flat-square)](https://platform.openai.com/docs/guides/developer-mode)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.8-3178c6?style=flat-square)](https://www.typescriptlang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green?style=flat-square)](LICENSE)
-[![Windows](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-0078d4?style=flat-square)](https://nodejs.org)
+[![Platforms](https://img.shields.io/badge/Native-Windows%20%7C%20macOS%20%7C%20Linux-0078d4?style=flat-square)](docs/cross-platform.md)
 
-[Quick Start](#-quick-start) · [Connect ChatGPT](#-connect-chatgpt) · [Tools](#-tools) · [Tunnel](#-tunnel-options) · [Troubleshooting](#-troubleshooting) · [Tiếng Việt](#-tiếng-việt)
+[Quick Start](#-quick-start) · [Permissions](#-permissions) · [Connect ChatGPT](#-connect-chatgpt) · [Tools](#-tools) · [Skills](#-skills) · [Cross-platform](docs/cross-platform.md) · [Tiếng Việt](#-tiếng-việt)
 
 </div>
 
 ---
 
-ChatGPT Local Coder is a **self-hosted MCP server** that gives ChatGPT (and any MCP client) full access to your machine — read and edit code, run `npm test`, manage git, apply unified diffs, and explore projects with `glob` / `grep`.
+ChatGPT Local Coder is a **self-hosted MCP server** that turns ChatGPT — or any
+MCP client — into a coding agent on your own machine: read and edit code, run
+`npm test`, manage git, apply unified diffs, explore with `glob` / `grep`, run
+installed skills, and hand work to another local CLI.
 
-No desktop app. No vendor lock-in. Run one Node process on your PC, expose it through a tunnel, and code from ChatGPT in the browser.
+One Node process. No desktop app, no container, no vendor lock-in. **Native
+Windows, macOS and Linux** — not WSL, not Docker.
 
 ```
-┌─────────────────┐     HTTPS      ┌──────────────────┐     localhost     ┌─────────────────────┐
-│   ChatGPT Web   │ ─────────────► │  Tunnel (opt.)   │ ────────────────► │  chatgpt-local-coder │
-│ Developer Mode  │                │ OpenAI / CF      │      :3000/mcp    │  40+ MCP tools       │
-└─────────────────┘                └──────────────────┘                   └──────────┬──────────┘
+┌─────────────────┐     HTTPS      ┌──────────────────┐    127.0.0.1     ┌──────────────────────┐
+│   ChatGPT Web   │ ─────────────► │  Tunnel (opt.)   │ ───────────────► │  chatgpt-local-coder │
+│ Developer Mode  │                │ OpenAI / CF      │      :3000/mcp   │  53 MCP tools        │
+└─────────────────┘                └──────────────────┘                  └──────────┬───────────┘
                                                                                     │
-                                         ┌──────────────────────────────────────────┼──────────┐
-                                         ▼                    ▼                    ▼          ▼
-                                   Filesystem              Shell + Git         Background    Project
-                                   read/write/patch        status/diff/commit   processes     context
+                     ┌───────────────┬──────────────┬────────────────┬──────────────┤
+                     ▼               ▼              ▼                ▼              ▼
+                 Filesystem      Shell + Git     Skills          Delegates      Settings
+                 scoped writes   host-user       ~/.chatgpt-     claude/codex   imported from
+                 to workspace    privileges      local-coder     opencode/grok  other agents
 ```
-
-## ✨ Why this project
-
-| | ChatGPT alone | **+ ChatGPT Local Coder** |
-|---|---|---|
-| Edit your repo | ❌ | ✅ `apply_patch`, `edit_file`, `multi_edit` |
-| Run tests / builds | ❌ | ✅ `run_command`, `start_process` |
-| Git workflow | ❌ | ✅ `git_status`, `git_commit`, `git_push`, … |
-| Explore codebase | Limited | ✅ `glob`, `grep`, `list_directory` |
-| Full disk access | ❌ | ✅ Any path on your machine |
-| Session recovery | — | ✅ Auto-recover after server restart |
-
-Built for **[ChatGPT Developer Mode](https://platform.openai.com/docs/guides/developer-mode)** with optimized tool annotations (fewer permission popups) and **[OpenAI Secure MCP Tunnel](https://platform.openai.com/docs/guides/secure-mcp-tunnel)** support (stable URL, no connector re-wiring every restart).
 
 ## 🚀 Quick Start
 
-**Requirements:** [Node.js](https://nodejs.org) 18+, npm, Git (optional, for git tools)
+**Requirements:** [Node.js](https://nodejs.org) 20+, npm. Git is optional and
+only needed for the `git_*` tools.
 
-```powershell
-git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
-cd chatgpt-local-coder
-copy .env.example .env          # edit WORKSPACE_PATH
-npm install
-npm run build
-.\start.ps1
-```
-
-Server runs at `http://localhost:3000` — health check: `http://localhost:3000/health`
-
-<details>
-<summary><b>macOS / Linux</b></summary>
+> **Not on the npm registry yet.** Install from a clone until it is published;
+> `npm i -g chatgpt-local-coder` will fail with `404 Not Found`.
 
 ```bash
 git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
 cd chatgpt-local-coder
-cp .env.example .env
-npm install && npm run build
-npm start
+npm install
+npm run build
+npm link                      # puts `chatgpt-local-coder` and `clc` on PATH
+
+chatgpt-local-coder init --workspace /path/to/your/project
+chatgpt-local-coder doctor
+chatgpt-local-coder up
 ```
 
+The last three commands are identical on all three operating systems. On
+Windows, `--workspace C:\Users\You\projects\my-app`; everything else is the
+same, because the CLI resolves per-OS config, state and cache directories for
+you.
+
+`npm link` symlinks the repo, so a later `npm run build` takes effect without
+reinstalling. `npm i -g .` installs a copy instead. Undo either with
+`npm unlink -g chatgpt-local-coder`. If you would rather not touch the global
+bin directory at all, every command below also works as
+`node dist/cli/main.js <command>` from the repo.
+
+- `init` writes the config file. Add `--interactive` to be prompted for anything
+  you did not pass as a flag, or `--force` to overwrite instead of merge.
+- `doctor` reports what would stop the host from working, and exits non-zero if
+  anything is at `error` level. It prints resolved paths, port availability,
+  discovered skills, detected delegate CLIs, and which secrets are `set` or
+  `unset` — never a secret value.
+- `up` runs the server in the foreground and connects the tunnel unless you pass
+  `--no-tunnel`.
+
+Health check: `http://127.0.0.1:3000/health`. Admin UI: `http://127.0.0.1:3001/ui`.
+
+<details>
+<summary><b>Add skills from <code>ai-agents-skills</code> (optional)</b></summary>
+
+Skills are discovered from several roots, so the host works without this. To
+install into the host's own agent home:
+
+```bash
+mkdir -p ~/.chatgpt-local-coder
+cd ~/ai-agents-skills
+python3 -m installer.ai_agents_skills --agents chatgpt-local-coder \
+  install --skills sagemath,zotero            # dry run: prints, writes nothing
+
+AAS_INSTALL_CONFIRM="I understand the installation and uninstall process" \
+python3 -m installer.ai_agents_skills --agents chatgpt-local-coder \
+  install --apply --real-system --skills sagemath,zotero
+```
+
+`install` is a dry run by default. Applying needs `--apply`, the confirmation
+variable, and `--real-system` for writes to a real home directory. Check it with
+`… --agents chatgpt-local-coder verify`, and undo it with `… uninstall`.
+
 </details>
+
+<details>
+<summary><b>Run it in the background instead of the foreground</b></summary>
+
+```bash
+chatgpt-local-coder service install     # systemd user unit / LaunchAgent / schtasks logon task
+chatgpt-local-coder service status
+chatgpt-local-coder tunnel connect      # the service does not manage the tunnel
+```
+
+No elevation is required on any of the three platforms. See
+[docs/cross-platform.md](docs/cross-platform.md#4-background-service) for what
+each mechanism does and does not survive.
+
+</details>
+
+## 🔐 Permissions
+
+The default profile is **`workspace`**, not full disk access.
+
+| Profile | Read | Write | Shell commands |
+|---|---|---|---|
+| **`workspace`** *(default)* | anywhere | workspace roots only | allowed |
+| `open` | anywhere | anywhere | allowed |
+| `readonly` | anywhere | denied | denied |
+
+Widen or narrow it either way:
+
+```bash
+chatgpt-local-coder config set permissionProfile open     # persistent
+chatgpt-local-coder up --profile open                     # this run only
+chatgpt-local-coder init --workspace A --workspace B      # more roots, same profile
+```
+
+> **Approved shell commands run with full host-user privileges.** The
+> `workspace` profile scopes *file tools*. It does not sandbox `run_command`:
+> once a command is approved, `npm`, `python`, or a subshell it starts can reach
+> anything your user account can reach. There is no seccomp, Job Object, or
+> sandbox-exec layer here. Treat `workspace` as a guardrail against an agent's
+> mistakes, not as a security boundary against a hostile one.
+
+> **Delegate CLIs are not governed by this profile either.** When
+> `agent_delegate` invokes `claude`, `codex`, `opencode` or `grok`, that CLI runs
+> as your user under its own configuration. Restricting `cwd` bounds where the
+> delegate's work starts, not what it may touch.
+
+The MCP listener binds `127.0.0.1` unless you explicitly override `bindHost`.
+Expose it to the internet only through a tunnel you control.
 
 ## 🔌 Connect ChatGPT
 
 ### 1. Enable Developer Mode
 
-1. Open [ChatGPT](https://chatgpt.com) → **Settings** → **Apps & Connectors**
-2. Under **Advanced**, enable **Developer mode**
+In ChatGPT, open **Settings → Connectors** and enable **Developer mode** under
+the advanced options.
 
-### 2. Expose your server (pick one tunnel)
+> **This UI path is version-sensitive.** OpenAI has moved it between *Settings →
+> Connectors → Advanced* and *Settings → Apps & Connectors → Advanced*, and
+> availability depends on your plan tier. If it is not where this says, follow
+> the [official Developer Mode guide](https://platform.openai.com/docs/guides/developer-mode),
+> which is the authority — not this README.
 
-See [Tunnel options](#-tunnel-options) below. You need a **public HTTPS** URL pointing to `http://localhost:3000/mcp`.
+### 2. Expose the server
 
-### 3. Create a connector
+```bash
+chatgpt-local-coder tunnel init      # download + verify tunnel-client, create the alias
+chatgpt-local-coder tunnel connect   # start the supervised runtime
+chatgpt-local-coder tunnel status
+```
 
-1. **Settings** → **Connectors** → **Create**
-2. Fill in:
+`tunnel init` resolves a `tunnel-client` binary from `tunnel.binPath`, the
+cache, or `PATH` before downloading anything; a download is verified against the
+release `SHA256SUMS.txt` before it is unpacked.
+
+> `tunnel connect` **starts a managed background runtime as a side effect.** Do
+> not run it just to read its help — use `chatgpt-local-coder tunnel --help`.
+
+Tunnel credentials come from
+[OpenAI Platform → Tunnels](https://platform.openai.com/settings/organization/tunnels)
+and [→ API keys](https://platform.openai.com/settings/organization/api-keys).
+Store them as secrets, not as literals on a command line:
+
+```bash
+chatgpt-local-coder secrets set OPENAI_TUNNEL_ID
+chatgpt-local-coder secrets set OPENAI_TUNNEL_API_KEY
+chatgpt-local-coder secrets list                   # names and sources, never values
+```
+
+`tunnel init` and `tunnel connect` pick them up on their own. See
+[docs/credentials.md](docs/credentials.md) for what each credential is, the
+permissions it needs, and how to obtain it step by step.
+
+Cloudflare Quick Tunnel still works as a free alternative
+(`cloudflared tunnel --url http://localhost:3000`), but its URL changes on every
+restart, so the connector needs re-wiring each time.
+
+### 3. Create the connector
+
+**Settings → Connectors → Create**, then:
 
 | Field | Value |
 |-------|-------|
 | **Name** | `Local Coder` |
 | **Description** | `Local coding agent. First call agent_status + project_context. Use glob/grep to explore, apply_patch to edit, run_command for shell.` |
-| **URL** | Your tunnel HTTPS URL (e.g. `https://…` or OpenAI Tunnel ID) |
+| **URL** | Your tunnel HTTPS URL, or the `tunnel_…` ID under **Connection type → Tunnel** |
 | **Authentication** | None |
 
-3. **Create** → verify tools appear in the list
+### 4. Tag the connector in every chat
 
-### 4. Use in chat — **must tag the connector**
+Every message that should use local tools **must include the connector**. If you
+skip this, ChatGPT uses only its built-in tools, shows *"Looking for available
+tools"*, then **"Error in message stream"** — with **no server log at all**,
+because the MCP server was never called.
 
-Every message that should use local tools **must include the connector**. If you skip this, ChatGPT only uses built-in tools, may show *"Looking for available tools"* / *"Đang tìm các công cụ có sẵn"*, then **"Error in message stream"** / **"Lỗi trong luồng tin nhắn"** — with **no error in server logs** (the MCP server was never called).
+Two ways to tag:
 
-**How to tag (pick one):**
+1. **New chat → `+` (tools) → More → enable Local Coder** — stays on for that chat.
+2. Type **`@`** in the message and pick the connector so it appears as a chip.
 
-1. **Before sending:** **New chat** → **+** (tools) → **More** → enable **Local Coder** (connector stays on for that chat).
-2. **In the message:** type **`@`** and choose **Local Coder** (or your connector name) so it appears as a pill/chip above the input.
-
-Then send your prompt. You should see tool permission prompts or MCP activity — not a dead stream with no server log.
-
-Example prompts (after tagging):
-
-- *"Read package.json and explain the dependencies"*
-- *"Run npm test and fix any failures"*
-- *"Find all TODO comments with grep and summarize"*
-
-> **Tip:** After server updates or restarts → **Refresh** the connector and start a **new chat** (re-tag the connector).  
-> **Avoid** clicking **"Always allow"** on permission popups — it can reset the MCP session. Configure permissions in **Settings → Apps** instead.
-
-## 🌐 Tunnel options
-
-### Option A — OpenAI Secure MCP Tunnel *(recommended)*
-
-Stable tunnel ID — connector URL never changes.
-
-```powershell
-# Terminal 1
-.\start.ps1 -Force
-
-# Terminal 2 — first time only
-.\openai-tunnel-init.bat    # enter tunnel_id + Runtime API key from OpenAI Platform
-
-# Every time after
-.\openai-tunnel.bat
-```
-
-Get credentials: [OpenAI Platform → Tunnels](https://platform.openai.com/settings/organization/tunnels)
-
-In ChatGPT Connectors: **Connection type → Tunnel** → paste your `tunnel_…` ID.
-
-### Option B — Cloudflare Quick Tunnel
-
-Free, but URL changes on every restart (update connector each time).
-
-```powershell
-# Terminal 1
-.\start.bat
-
-# Terminal 2
-.\tunnel.bat    # copy https://….trycloudflare.com into connector URL
-```
-
-Install cloudflared: `winget install Cloudflare.cloudflared`
+> After a server update or restart: **Refresh** the connector and start a **new
+> chat**. Avoid clicking **"Always allow"** on permission popups — it can reset
+> the MCP session. Configure permissions in **Settings → Apps** instead.
 
 ## 🧰 Tools
 
-**40+ tools** with structured JSON responses `{ ok, tool, summary, data }`.
+**53 tools** in the `full` profile, **27** in the default `slim` profile, all
+returning structured JSON `{ ok, tool, summary, data }`. Switch with
+`chatgpt-local-coder up --tool-profile full`.
+
+The tables below list all 53. The default `slim` profile exposes only these 27 —
+anything else returns `Tool not found` until you switch to `full`:
+
+```
+agent_delegate  agent_status  apply_patch   edit_file      git_add
+git_commit      git_diff      git_restore   git_status     glob
+grep            list_directory load_path_rules  mcp_servers  multi_edit
+process_output  project_context  read_text_file  remember   rewind
+run_command     shell_status  skill_list    skill_read     skill_run
+start_process   write_file
+```
 
 ### Onboarding *(call these first)*
 
 | Tool | Description |
 |------|-------------|
-| `agent_status` | Permissions, workspace roots, audit log |
+| `agent_status` | Active profile, workspace roots, audit log |
 | `project_context` | Reads AGENTS.md, README, CLAUDE.md, configs |
 
 ### Filesystem
@@ -170,18 +255,17 @@ Install cloudflared: `winget install Cloudflare.cloudflared`
 |------|-------------|
 | `read_text_file` | Read source files (offset + limit) |
 | `write_file` | Create or overwrite files |
-| `edit_file` | Find-and-replace edits |
-| `multi_edit` | Multiple edits in one file |
+| `edit_file` / `multi_edit` | Find-and-replace edits, one or many |
 | `replace_regex` | Regex replace in file |
 | `apply_patch` | Unified / Codex-style patches |
-| `glob` | Find files by pattern (sorted by mtime) |
-| `grep` | Search content (content / files / count modes) |
-| `list_directory` | List folder contents |
-| `directory_tree` | Recursive tree as JSON |
+| `glob` / `grep` / `search_files` | Find by name, by content, or both |
+| `list_directory` / `directory_tree` | List or walk a folder |
 | `create_directory` | Create folders |
 | `delete_file` / `delete_directory` | Remove files or dirs |
 | `copy_file` / `move_file` | Copy or rename |
 | `read_file_base64` / `write_file_base64` | Binary file support |
+| `list_allowed_directories` / `load_path_rules` | Inspect the active path scope |
+| `rewind` | Undo file edits through automatic checkpoints |
 
 ### Shell
 
@@ -190,7 +274,7 @@ Install cloudflared: `winget install Cloudflare.cloudflared`
 | `run_command` | Run shell commands (`npm test`, builds, …) |
 | `shell_status` / `shell_reset` | Persistent shell session |
 | `start_process` | Long-running / background commands |
-| `process_status` / `process_output` / `stop_process` | Manage background jobs |
+| `process_status` / `process_output` / `stop_process` / `clear_processes` | Manage background jobs |
 
 ### Git
 
@@ -198,10 +282,20 @@ Install cloudflared: `winget install Cloudflare.cloudflared`
 |------|-------------|
 | `git_status` / `git_diff` / `git_log` | Inspect repo |
 | `git_add` / `git_commit` | Stage and commit |
-| `git_branch` / `git_checkout` | Branch list, create, switch (local only) |
+| `git_branch` / `git_checkout` | Branch list, create, switch |
 | `git_restore` | Restore tracked files to last commit |
 | `git_push` / `git_pull` | Sync with configured remote |
 | `git_stash` / `git_reset` | Stash and reset |
+
+### Host
+
+| Tool | Description |
+|------|-------------|
+| `skill_list` / `skill_read` / `skill_run` | Discover, read and run installed skills |
+| `agent_delegate` / `delegate_status` | Hand a task to another local CLI |
+| `settings_status` | What was imported from other agents, and which source won |
+| `mcp_servers` / `mcp_tools` / `mcp_call` | Proxy another MCP server on this machine |
+| `remember` | Append to the project memory file |
 
 ### Claude Code ↔ MCP mapping
 
@@ -212,94 +306,171 @@ Install cloudflared: `winget install Cloudflare.cloudflared`
 | `Edit` / `MultiEdit` | `edit_file` / `multi_edit` |
 | `Glob` / `Grep` / `LS` | `glob` / `grep` / `list_directory` |
 | `Bash` | `run_command` |
-| — | `apply_patch`, `git_*`, `project_context` |
+| `Task` / subagent | `agent_delegate` |
+| `Skill` | `skill_run` |
+| — | `apply_patch`, `git_*`, `project_context`, `rewind`, `mcp_*` |
+
+## 🧩 Skills
+
+Skills are `SKILL.md` files with frontmatter. Install them with
+[`ai-agents-skills`](https://github.com/hoangcoderr/ai-agents-skills), which has
+a `chatgpt-local-coder` target:
+
+```bash
+python3 -m installer.ai_agents_skills --agent chatgpt-local-coder plan --skills sagemath
+python3 -m installer.ai_agents_skills --agent chatgpt-local-coder install --apply --skills sagemath
+```
+
+That writes `~/.chatgpt-local-coder/skills/<name>/SKILL.md` plus a managed block
+in `~/.chatgpt-local-coder/AGENTS.md`, which the host loads as user-level memory.
+
+```bash
+chatgpt-local-coder skills list
+chatgpt-local-coder skills read sagemath
+chatgpt-local-coder skills run sagemath -- --help
+```
+
+The host also reads skills installed for other agents. Roots are searched in a
+fixed order and the first root to define a `name` wins, so a project-local skill
+shadows a global one — see
+[docs/cross-platform.md](docs/cross-platform.md#6-skills-and-symlinks) for the
+full precedence list.
 
 ## ⚙️ Configuration
 
-Copy `.env.example` → `.env`:
+`chatgpt-local-coder config path` prints where `config.json` lives on this OS.
+A project may also carry `.chatgpt-local-coder.json` in its root, which layers
+over the user config for that workspace.
 
-```env
-PORT=3000
-WORKSPACE_PATH=C:\Users\You\projects\my-app
-CHATGPT_AUTO_APPROVE=true
-SHELL_TIMEOUT=120
-MCP_SESSION_RECOVERY=true
+| Key | Default | Description |
+|---|---|---|
+| `workspaceRoots` | `[cwd]` | Roots the host may write in under the `workspace` profile |
+| `permissionProfile` | `workspace` | `workspace`, `open`, or `readonly` |
+| `bindHost` | `127.0.0.1` | Listener address. Change only if you know why |
+| `port` / `adminPort` | `3000` / `3001` | MCP and admin ports |
+| `toolProfile` | `slim` | `slim` (27 tools) or `full` (53) |
+| `shellTimeoutSec` | `120` | Cap for `run_command` |
+| `skills.allowExecution` | `true` | Whether `skill_run` may execute |
+| `skills.maxRuntimeSec` | `300` | Cap for `skill_run` |
+| `settings.import` | `true` | Import settings from other agents |
+| `settings.sources` | `codex, grok, opencode, claude` | Which to read, lowest precedence first |
+| `delegates.enabled` | `true` | Whether `agent_delegate` may run |
+| `delegates.order` | `claude, codex, opencode, grok` | CLI preference order |
+| `tunnel.alias` | `chatgpt-local-coder` | tunnel-client runtime alias |
 
-# OpenAI Secure Tunnel (optional)
-OPENAI_TUNNEL_ID=
-OPENAI_TUNNEL_API_KEY=
+```bash
+chatgpt-local-coder config get permissionProfile
+chatgpt-local-coder config set port 4000
+chatgpt-local-coder config set skills.allowExecution false
 ```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `WORKSPACE_PATH` | `cwd` | **Your project root** (like `cd` before `claude`). Auto-loads `CLAUDE.md` / `AGENTS.md` into MCP instructions |
-| `CHATGPT_AUTO_APPROVE` | `true` | Tool annotations to reduce ChatGPT popups |
-| `MCP_SESSION_RECOVERY` | `true` | Auto-recover stale sessions after restart |
-| `SHELL_TIMEOUT` | `120` | Max seconds for `run_command` |
-| `FULL_DISK_ACCESS` | `true` | Access any path on the machine |
+Environment overrides exist for the settings most often changed per-run:
+`CLC_CONFIG_DIR`, `CLC_STATE_DIR`, `CLC_CACHE_DIR`, `CLC_PERMISSION_PROFILE`,
+`CLC_BIND_HOST`, `CLC_SHELL`, `CLC_SKILL_ROOTS`, `CLC_SKILL_EXECUTION`,
+`CLC_SETTINGS_IMPORT`, `CLC_DELEGATES`, `CLC_HOOKS`, `CLC_TUNNEL_ALIAS`,
+`CLC_TUNNEL_BIN`, `WORKSPACE_PATH`, `CHATGPT_TOOL_PROFILE`.
 
-> **Full machine access** is enabled by default. `WORKSPACE_PATH` only sets the default cwd — absolute paths like `D:\Projects\…` work everywhere.
+### Imported settings
+
+The host reads `~/.claude/settings.json`, `~/.codex/config.toml` and the Grok
+and OpenCode equivalents. **It never writes them.** Two rules hold without
+exception:
+
+- Imported `permissions.deny` entries are **always** enforced.
+- Imported `permissions.allow` entries **never widen** the host profile. They
+  only reduce prompting inside what the profile already permits.
+
+`chatgpt-local-coder settings show` lists every source, what it contributed, and
+which one won each key.
+
+### Secrets
+
+Secrets are read from the environment first and from `secrets.json` in the
+config dir second. The file is created `0600`, and on Windows its DACL is
+restricted to your account. Values are never logged; `doctor` prints only `set`
+or `unset`.
+
+```bash
+chatgpt-local-coder secrets set OPENAI_TUNNEL_API_KEY   # hidden prompt; never an argument
+chatgpt-local-coder secrets list                        # names and sources
+chatgpt-local-coder secrets delete NAME
+chatgpt-local-coder secrets path
+```
+
+`scripts/set-secrets.sh` does the same without the CLI installed. Full guide:
+[docs/credentials.md](docs/credentials.md).
 
 ## 🏗️ Architecture
 
 ```
 src/
-├── index.ts                 # Express + MCP session manager
-├── server-factory.ts        # Tool registration
-├── lib/
-│   ├── mcp-session-manager.ts   # Session recovery, TTL
-│   ├── patch.ts             # apply_patch engine
-│   └── persistent-shell.ts  # Stateful shell
-└── tools/
-    ├── filesystem.ts        # 18 tools
-    ├── shell.ts             # 8 tools
-    ├── git.ts               # 11 tools
-    └── context.ts           # agent_status, project_context
+├── index.ts             # Express + MCP session manager
+├── server-factory.ts    # Tool registration
+├── cli/                 # init, doctor, up/down/status, tunnel, service, skills, settings, config
+├── config/              # per-OS paths, layered load, zod schema
+├── lib/                 # platform adapter, permissions, patch, shell, secrets, memory
+├── skills/              # discovery, frontmatter, registry, execution
+├── settings/            # read-only adapters for claude/codex/grok/opencode
+├── delegates/           # local CLI fork backends
+├── services/            # systemd user unit, LaunchAgent, schtasks task
+├── tunnel/              # release resolution, verification, runtime supervision
+└── tools/               # filesystem, shell, git, context, host
 ```
 
 - **Transport:** MCP Streamable HTTP (`/mcp` and `/`)
-- **Session:** Stateful with auto-recovery when ChatGPT holds a stale session ID
-- **Output:** Structured JSON from every tool
+- **Session:** stateful, with auto-recovery when a client holds a stale session ID
+- **Output:** structured JSON from every tool
 
 ## 🧪 Development
 
-```powershell
-npm run build          # compile TypeScript
-npm test               # patch + tool unit tests
-npm run dev            # watch mode (tsx)
-node scripts/test-mcp-session.mjs   # integration test (server must be running)
+```bash
+npm run build       # compile TypeScript
+npm run test:all    # build + unit + server-level + integration suites
+npm test            # unit suites only
+npm run dev         # watch mode (tsx)
 ```
+
+CI runs `npm ci`, `npm run build` and `npm run test:all` on `ubuntu-latest`,
+`windows-latest` and `macos-latest` against Node 20 and 22. No job reaches the
+network except `npm ci`.
 
 ## 🔒 Security
 
-This server grants **full access to your machine** — files, shell, git. Only expose it through a tunnel you control. Never share your connector URL or tunnel API keys.
-
-- `.env` and secrets are gitignored
-- Audit log: `.mcp-audit.log` (optional, configurable)
-- Use on a trusted network / personal machine only
+- The listener binds `127.0.0.1` by default. Expose it only through a tunnel you control.
+- Default writes are scoped to the workspace roots — but **approved shell
+  commands and delegate CLIs are not sandboxed**. See [Permissions](#-permissions).
+- Secrets live in a `0600` file outside the repo, or in the environment. Never in `config.json`.
+- The tunnel manager passes credentials only as `env:NAME` or `file:/path`
+  references, never as literal key material on a command line.
+- Audit log: `.mcp-audit.log` (optional, configurable).
+- Use on a machine and network you trust.
 
 ## 🩺 Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
-| **"Error in message stream"** / **"Lỗi trong luồng tin nhắn"** right after *"Looking for tools"* — **no server log** | You did **not tag the connector**. New chat → **+** → **More** → enable connector, or type **`@Local Coder`** in the message. Then retry. |
-| **Resource not found** on tool call | Refresh connector + new chat. Server auto-recovers sessions — ensure latest build is running. |
-| **Connection failed** | Check `.\start.ps1` + tunnel are both running. URL must be HTTPS. |
-| **Permission popup every call** | Settings → Apps → set connector to *Ask before important changes*. Don't use popup "Always allow". |
-| **Tool blocked by OpenAI safety** | Not a server bug. Retry with `run_command` (response may include `run_command_fallback`). Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |
-| **`stream canceled`** in tunnel log | Server/tunnel restarted mid-session → refresh connector, new chat. |
-| **Tunnel URL keeps changing** | Switch to OpenAI Secure Tunnel (`openai-tunnel.bat`). |
-| **Access denied** | Wrong path or OS permissions on that file. |
-| **git not found** | Install [Git](https://git-scm.com). |
+| **"Error in message stream"** right after *"Looking for tools"* — **no server log** | You did not tag the connector. New chat → **+** → **More** → enable it, or type **`@Local Coder`**. |
+| **Access denied** on a write | Expected under the `workspace` profile if the path is outside your roots. Add a root with `init --workspace`, or switch profile. |
+| **A tool is denied and names an imported rule** | A `permissions.deny` entry in another agent's settings matched. Remove it there, or set `settings.import` to `false`. |
+| **Resource not found** on a tool call | Refresh the connector and start a new chat. Sessions auto-recover; make sure the latest build is running. |
+| **Connection failed** | `chatgpt-local-coder status` — server and tunnel must both be up, and the URL must be HTTPS. |
+| **Permission popup on every call** | Settings → Apps → set the connector to *Ask before important changes*. Do not use the popup's "Always allow". |
+| **Tool blocked by OpenAI safety** | Not a server bug. Retry via `run_command`; responses may include a `run_command_fallback`. Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |
+| **`stream canceled` in the tunnel log** | Server or tunnel restarted mid-session. Refresh the connector, new chat. |
+| **Tunnel URL keeps changing** | Use the OpenAI Secure Tunnel (`tunnel init` / `tunnel connect`) instead of a Cloudflare quick tunnel. |
+| **A command works on one OS, not another** | Shells differ per platform and the host does not translate. See [docs/cross-platform.md](docs/cross-platform.md#2-shell-selection). |
+| **git not found** | Install [Git](https://git-scm.com). Everything except the `git_*` tools works without it. |
 
-See also [AGENTS.md](AGENTS.md) for agent onboarding and `apply_patch` format.
+`chatgpt-local-coder doctor` diagnoses most of the above in one command. See also
+[AGENTS.md](AGENTS.md) for agent onboarding and the `apply_patch` format.
 
 ## 📚 References
 
 - [Model Context Protocol](https://modelcontextprotocol.io)
 - [MCP TypeScript SDK](https://github.com/modelcontextprotocol/typescript-sdk)
-- [ChatGPT Apps SDK](https://developers.openai.com/apps-sdk)
+- [ChatGPT Developer Mode](https://platform.openai.com/docs/guides/developer-mode)
 - [OpenAI Secure MCP Tunnel](https://platform.openai.com/docs/guides/secure-mcp-tunnel)
+- [ai-agents-skills](https://github.com/hoangcoderr/ai-agents-skills)
 
 ## 📄 License
 
@@ -314,22 +485,49 @@ If this saves you time, **star the repo** — it helps others find it.
 ## 🇻🇳 Tiếng Việt
 
 **ChatGPT Local Coder** biến ChatGPT web thành agent code trên máy bạn qua MCP.
+Chạy native trên **Windows, macOS và Linux** — không cần WSL hay Docker.
 
-```powershell
+> **Chưa có trên npm registry.** Cài từ clone; `npm i -g chatgpt-local-coder` sẽ
+> báo `404 Not Found`.
+
+```bash
 git clone https://github.com/hoangcoderr/chatgpt-local-coder.git
 cd chatgpt-local-coder
-copy .env.example .env
-npm install && npm run build
-.\start.ps1                    # terminal 1
-.\openai-tunnel.bat            # terminal 2 (tunnel cố định)
+npm install
+npm run build
+npm link                      # đưa `chatgpt-local-coder` và `clc` vào PATH
+
+chatgpt-local-coder init --workspace /duong/dan/project
+chatgpt-local-coder doctor
+chatgpt-local-coder up
 ```
 
-**ChatGPT:** Settings → Connectors → tạo connector → chọn tunnel → Refresh → chat mới.
+Trên Windows dùng `--workspace C:\Users\Ban\projects\my-app`. Ba lệnh cuối
+giống hệt nhau trên cả ba hệ điều hành. Gỡ link: `npm unlink -g
+chatgpt-local-coder`.
 
-**Bắt buộc tag connector mỗi chat:** Chat mới → **+** → **More** → bật connector, hoặc gõ **`@`** + tên connector trong ô chat. Nếu không tag, ChatGPT báo *"Đang tìm các công cụ có sẵn"* rồi *"Lỗi trong luồng tin nhắn"* — **server không có log lỗi** vì MCP chưa được gọi.
+**Quyền mặc định là `workspace`, không phải full disk.** Đọc file ở đâu cũng
+được, nhưng **ghi** chỉ trong các workspace root. Muốn mở rộng:
+`chatgpt-local-coder config set permissionProfile open`.
 
-**WORKSPACE_PATH:** đặt đúng thư mục project (không phải thư mục `chatgpt-local-coder`). Server tự đọc `CLAUDE.md` / `AGENTS.md` giống Claude Code.
+> **Lưu ý quan trọng:** lệnh shell đã được duyệt chạy với **toàn quyền của user**
+> trên máy. Profile `workspace` chỉ giới hạn các tool file, **không** sandbox
+> `run_command`. Các delegate CLI (`claude`, `codex`, …) cũng không bị profile
+> này quản lý.
 
-**Lưu ý:** Không bấm **"Luôn cho phép"** trên popup — cấu hình quyền ở Settings → Apps. Sau khi restart server: Refresh connector + mở chat mới + tag lại connector.
+**ChatGPT:** Settings → Connectors → bật **Developer mode** → tạo connector →
+chọn tunnel → Refresh → mở chat mới. Vị trí Developer mode trong giao diện
+ChatGPT có thể thay đổi theo phiên bản và gói tài khoản; nếu không thấy, xem
+[hướng dẫn chính thức](https://platform.openai.com/docs/guides/developer-mode).
 
-Chi tiết cho AI agent: [AGENTS.md](AGENTS.md)
+**Bắt buộc tag connector mỗi chat:** Chat mới → **+** → **More** → bật connector,
+hoặc gõ **`@`** + tên connector. Nếu không tag, ChatGPT báo *"Đang tìm các công
+cụ có sẵn"* rồi *"Lỗi trong luồng tin nhắn"* — **server không có log** vì MCP
+chưa hề được gọi.
+
+**Không bấm "Luôn cho phép"** trên popup — nó thường đóng MCP session. Cấu hình
+quyền ở Settings → Apps thay vào đó.
+
+Chẩn đoán nhanh: `chatgpt-local-coder doctor`.
+Chi tiết cho AI agent: [AGENTS.md](AGENTS.md).
+Khác biệt giữa các hệ điều hành: [docs/cross-platform.md](docs/cross-platform.md).

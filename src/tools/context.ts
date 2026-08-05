@@ -81,7 +81,7 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       annotations: toolAnnotations("read"),
     },
     async ({ path: projectPath, max_depth, max_bytes_per_file }) => {
-      const root = projectPath ? await validatePath(projectPath) : workspaceRoot;
+      const root = projectPath ? await validatePath(projectPath, "read") : workspaceRoot;
       const files = await findContextFiles(root, max_depth);
       const fileContents: Array<{ path: string; content: string; truncated: boolean }> = [];
 
@@ -165,7 +165,7 @@ export function registerContextTools(server: McpServer, workspaceRoot: string): 
       annotations: toolAnnotations("read"),
     },
     async ({ path: filePath }) => {
-      const validPath = await validatePath(filePath);
+      const validPath = await validatePath(filePath, "read");
       const rules = await loadPathRulesForFile(workspaceRoot, validPath);
       await audit({ tool: "load_path_rules", action: "read", target: validPath, status: "ok", details: { rules: rules.length } });
       return toolResult("load_path_rules", { path: validPath, rules, count: rules.length });

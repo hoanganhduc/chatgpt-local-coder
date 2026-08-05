@@ -3,13 +3,18 @@
 import "dotenv/config";
 import express from "express";
 import cors from "cors";
-import path from "path";
 
 import {
   setDefaultCwd,
   getDefaultCwd,
   getFullDiskAccess,
 } from "./lib/path-security.js";
+import {
+  setPermissionContext,
+  setImportedRuleCheck,
+  describePermissionProfile,
+} from "./lib/permissions.js";
+import { loadConfig } from "./config/load.js";
 import {
   consumeSessionTransportError,
   createSessionManager,
@@ -18,6 +23,7 @@ import {
 } from "./lib/mcp-session-manager.js";
 import { initUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { startAdminServer } from "./admin/server.js";
+import { getSecret } from "./lib/secrets.js";
 import { logMcpHttpEvent, logMcpRequest } from "./lib/activity-log.js";
 import {
   buildInstructionContext,
@@ -25,44 +31,58 @@ import {
   type InstructionContext,
 } from "./lib/instruction-context.js";
 import { getChatGptToolProfile } from "./lib/tool-profile.js";
+import { loadSkillRegistry } from "./skills/registry.js";
+import { checkImportedRules, loadSettings } from "./settings/index.js";
+import { setHookConfig } from "./hooks/engine.js";
+import { registerPostEditHook } from "./lib/post-edit-hooks.js";
+import { detectDelegates } from "./delegates/index.js";
 
-const PORT = parseInt(process.env.PORT || "3000", 10);
-const ADMIN_PORT = parseInt(process.env.ADMIN_PORT || "3001", 10);
-const SHELL_TIMEOUT = parseInt(process.env.SHELL_TIMEOUT || "120", 10);
+const { config } = loadConfig();
+
+const PORT = config.port;
+const ADMIN_PORT = config.adminPort;
+const SHELL_TIMEOUT = config.shellTimeoutSec;
+const BIND_HOST = config.bindHost;
 const SESSION_RECOVERY =
   (process.env.MCP_SESSION_RECOVERY || "true").toLowerCase() !== "false";
 
-function splitWorkspaceEnv(value: string | undefined): string[] {
-  if (!value) return [];
-  return value
-    .split(";")
-    .map((p) => p.trim().replace(/^['\"]|['\"]$/g, ""))
-    .filter(Boolean);
-}
-
-function resolveWorkspaceRoots(): string[] {
-  const configuredRoots = [
-    ...splitWorkspaceEnv(process.env.WORKSPACE_PATH || process.cwd()),
-    ...splitWorkspaceEnv(process.env.EXTRA_WORKSPACE_PATHS),
-    ...splitWorkspaceEnv(process.env.WORKSPACE_PATHS),
-    ...splitWorkspaceEnv(process.env.ALLOWED_WORKSPACE_PATHS),
-  ];
-
-  const roots = configuredRoots.map((p) => path.resolve(p));
-  return [...new Set(roots)];
-}
-
-const workspaceRoots = resolveWorkspaceRoots();
+const workspaceRoots = config.workspaceRoots;
 const workspaceRoot = workspaceRoots[0] || process.cwd();
 setDefaultCwd(workspaceRoot);
+setPermissionContext({ profile: config.permissionProfile, roots: workspaceRoots });
 
 const upstreamManager = await initUpstreamManager();
+
+// Settings are imported before skills so that skill roots contributed by
+// another agent's config are part of the discovery set.
+const settings = await loadSettings({
+  workspaceRoots,
+  sources: config.settings.sources,
+  enabled: config.settings.import,
+  host: { skillRoots: config.skills.roots },
+});
+setImportedRuleCheck(checkImportedRules);
+
+// Hooks come from imported settings; the post-edit checks register themselves
+// so everything that runs after a tool call goes through one engine.
+setHookConfig({ enabled: config.hooks.enabled, matchers: settings.hooks });
+if (config.hooks.enabled) registerPostEditHook();
+
+// Discovery runs once here so instruction building and every MCP session share
+// one registry rather than re-walking every root per session.
+const skillRegistry = await loadSkillRegistry({
+  workspaceRoots,
+  extraRoots: [...settings.skillRoots, ...config.skills.roots],
+  enabled: config.skills.enabled,
+  disabled: config.skills.disabled,
+});
 
 const instructionContext: InstructionContext = await buildInstructionContext({
   workspaceRoot,
   workspaceRoots,
   pid: process.pid,
   adminPort: ADMIN_PORT,
+  fullDiskAccess: getFullDiskAccess(),
 });
 
 if (instructionContext.projectMemory.sections.length > 0) {
@@ -81,6 +101,28 @@ console.log(
   `[MCP] MCP instructions: ${Math.round(instructionContext.instructionBytes / 1024)}KB (agent prompt + env + git + memory)`
 );
 console.log(`[MCP] Tool profile: ${getChatGptToolProfile()} (CHATGPT_TOOL_PROFILE)`);
+console.log(
+  `[MCP] Skills: ${skillRegistry.skills.length} from ${skillRegistry.roots.length} root(s)` +
+    (skillRegistry.shadowed.length ? `, ${skillRegistry.shadowed.length} shadowed` : "")
+);
+const okSources = settings.sources.filter((s) => s.ok).length;
+const badSources = settings.sources.filter((s) => !s.ok);
+console.log(
+  `[MCP] Imported settings: ${okSources} file(s), ${settings.permissions.deny.length} deny rule(s) enforced` +
+    (badSources.length ? `, ${badSources.length} unreadable` : "")
+);
+for (const bad of badSources) console.warn(`[MCP] Settings unreadable: ${bad.path} — ${bad.error}`);
+const hookEvents = Object.entries(settings.hooks).filter(([, v]) => v.length);
+console.log(
+  `[MCP] Hooks: ${config.hooks.enabled ? "on" : "off"}` +
+    (hookEvents.length ? `, imported ${hookEvents.map(([e, v]) => `${e}×${v.length}`).join(" ")}` : "")
+);
+// PATH lookup only — the `--version` probe is deferred to first use so startup
+// never waits on four agent CLIs.
+const delegates = detectDelegates(config.delegates.order).filter((d) => d.available);
+console.log(
+  `[MCP] Delegates: ${config.delegates.enabled ? delegates.map((d) => d.id).join(", ") || "none installed" : "disabled"}`
+);
 
 const sessionManager = createSessionManager({
   workspaceRoot,
@@ -88,6 +130,15 @@ const sessionManager = createSessionManager({
   workspaceRoots,
   port: PORT,
   projectMemoryInstructions: instructionContext.instructionsText,
+  skills: {
+    allowExecution: config.skills.allowExecution,
+    maxRuntimeSec: config.skills.maxRuntimeSec,
+  },
+  delegates: {
+    enabled: config.delegates.enabled,
+    order: config.delegates.order,
+    timeoutSec: config.delegates.timeoutSec,
+  },
 });
 
 const app = express();
@@ -146,7 +197,8 @@ app.get("/health", (_req, res) => {
     name: "codex-mcp-server",
     workspace: workspaceRoot,
     defaultCwd: getDefaultCwd(),
-    fullMachineAccess: true,
+    permissionProfile: config.permissionProfile,
+    workspaceRoots,
     fullDiskAccess: getFullDiskAccess(),
     activeSessions: sessionManager.count(),
     sessionRecovery: SESSION_RECOVERY,
@@ -261,6 +313,15 @@ for (const mcpPath of MCP_PATHS) {
 
 sessionManager.startCleanup();
 
+// The admin guard reads process.env.ADMIN_TOKEN, so a token that lives only in
+// the secret store would leave the admin API unauthenticated while `doctor`
+// reported the token as set. Hydrate it here, before the admin server starts.
+// An exported variable still wins, matching getSecret's own precedence.
+if (!process.env.ADMIN_TOKEN) {
+  const storedAdminToken = await getSecret("ADMIN_TOKEN");
+  if (storedAdminToken) process.env.ADMIN_TOKEN = storedAdminToken;
+}
+
 const adminServer = startAdminServer({
   port: ADMIN_PORT,
   host: "127.0.0.1",
@@ -272,34 +333,42 @@ const adminServer = startAdminServer({
   instructionsPreview: () => instructionContext.instructionsText,
 });
 
-const server = app.listen(PORT, () => {
+// Bind loopback by default so the listener is not reachable over the LAN or a
+// Tailscale interface. Override with CLC_BIND_HOST only when that is intended.
+const server = app.listen(PORT, BIND_HOST, () => {
+  const display = BIND_HOST === "0.0.0.0" || BIND_HOST === "::" ? "localhost" : BIND_HOST;
   console.log("");
   console.log("========================================");
-  console.log("  Codex MCP Server");
+  console.log("  chatgpt-local-coder");
   console.log("========================================");
-  console.log(`  Local:     http://localhost:${PORT}`);
-  console.log(`  MCP:       http://localhost:${PORT}/`);
-  console.log(`  MCP alt:   http://localhost:${PORT}/mcp`);
-  console.log(`  Health:    http://localhost:${PORT}/health`);
+  console.log(`  Local:     http://${display}:${PORT}`);
+  console.log(`  MCP:       http://${display}:${PORT}/`);
+  console.log(`  MCP alt:   http://${display}:${PORT}/mcp`);
+  console.log(`  Health:    http://${display}:${PORT}/health`);
   console.log(`  Admin UI:  http://127.0.0.1:${ADMIN_PORT}/ui`);
+  console.log(`  Bind host: ${BIND_HOST}`);
   console.log(`  Default cwd: ${workspaceRoot}`);
-  console.log(`  Full machine access: ON (no path restrictions)`);
+  console.log(`  Permissions: ${describePermissionProfile()}`);
   console.log(`  Session recovery: ${SESSION_RECOVERY ? "ON" : "OFF"}`);
   console.log(`  PID:       ${process.pid}`);
   console.log("========================================");
-  console.log("  Dang chay... (Ctrl+C de dung)");
+  console.log("  Running... (Ctrl+C to stop)");
   console.log("========================================");
   console.log("");
 });
 
 server.on("error", (err: NodeJS.ErrnoException) => {
   if (err.code === "EADDRINUSE") {
-    console.error(`\n[LOI] Port ${PORT} da co server khac dang chay!`);
-    console.error("Chay lenh sau de tim process:");
-    console.error(`  netstat -ano | findstr ":${PORT}"`);
-    console.error("Hoac dung: .\\stop.bat de tat server cu\n");
+    console.error(`\n[ERROR] Port ${PORT} is already in use.`);
+    console.error("Find the process that holds it:");
+    console.error(
+      process.platform === "win32"
+        ? `  netstat -ano | findstr ":${PORT}"`
+        : `  lsof -nP -iTCP:${PORT} -sTCP:LISTEN`
+    );
+    console.error("Then stop it, or start with a different PORT.\n");
   } else {
-    console.error("\n[LOI] Khong the khoi dong server:", err.message, "\n");
+    console.error("\n[ERROR] Server failed to start:", err.message, "\n");
   }
   process.exit(1);
 });

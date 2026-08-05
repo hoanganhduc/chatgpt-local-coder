@@ -1,7 +1,18 @@
+/**
+ * Post-edit checks — syntax linters run against files a tool just wrote.
+ *
+ * These are configured separately from imported settings hooks (see
+ * `profiles/post-edit-hooks.json`) because they match on file globs rather than
+ * tool names. They reach tool dispatch by registering themselves as an internal
+ * `PostToolUse` hook, so there is one path through which anything runs after a
+ * tool call.
+ */
+
 import fs from "fs/promises";
 import path from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
+import { registerInternalHook } from "../hooks/engine.js";
 
 export interface PostEditHook {
   glob: string;
@@ -91,4 +102,49 @@ export async function runPostEditHooks(filePaths: string[]): Promise<Record<stri
 
   if (!results.length) return undefined;
   return { post_edit_hooks: results };
+}
+
+/** Tools whose result names files that were just written. */
+const EDIT_TOOLS = [
+  "write_file",
+  "write_file_base64",
+  "edit_file",
+  "multi_edit",
+  "replace_regex",
+  "apply_patch",
+  "move_file",
+  "copy_file",
+].join("|");
+
+/**
+ * Pull written paths out of a tool result. Single-file tools report `path`;
+ * multi-file `apply_patch` reports a `files` array whose failed entries are
+ * skipped, since nothing was written for those.
+ */
+function editedPaths(result: unknown): string[] {
+  const data = (result as { structuredContent?: { data?: Record<string, unknown> } })?.structuredContent?.data;
+  if (!data || data.dry_run === true) return [];
+
+  const paths: string[] = [];
+  if (typeof data.path === "string") paths.push(data.path);
+  if (Array.isArray(data.files)) {
+    for (const entry of data.files) {
+      const file = entry as { ok?: boolean; path?: unknown };
+      if (file?.ok !== false && typeof file?.path === "string") paths.push(file.path);
+    }
+  }
+  return paths;
+}
+
+export function registerPostEditHook(): void {
+  registerInternalHook("PostToolUse", {
+    name: "post-edit-checks",
+    matcher: EDIT_TOOLS,
+    run: async (ctx) => {
+      const paths = editedPaths(ctx.result);
+      if (!paths.length) return undefined;
+      const hooks = await runPostEditHooks(paths);
+      return hooks ? { enrich: hooks } : undefined;
+    },
+  });
 }

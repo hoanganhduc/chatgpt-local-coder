@@ -55,7 +55,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     },
     async ({ command, working_directory }) => {
       requireCommandAllowed(command);
-      const cwdOverride = working_directory ? await validatePath(working_directory) : undefined;
+      const cwdOverride = working_directory ? await validatePath(working_directory, "read") : undefined;
       const result = await execInShellSession(command, defaultCwd, timeoutSec * 1000, cwdOverride);
       await audit({
         tool: "run_command",
@@ -96,7 +96,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       annotations: toolAnnotations("edit"),
     },
     async ({ path: dirPath }) => {
-      const cwd = dirPath ? await validatePath(dirPath) : defaultCwd;
+      const cwd = dirPath ? await validatePath(dirPath, "read") : defaultCwd;
       resetShellSession(cwd);
       return toolResult("shell_reset", { cwd }, { summary: `shell cwd reset to ${cwd}` });
     }
@@ -113,7 +113,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
     },
     async ({ command, working_directory }) => {
       requireCommandAllowed(command);
-      const cwd = working_directory ? await validatePath(working_directory) : getShellStatus().cwd || defaultCwd;
+      const cwd = working_directory ? await validatePath(working_directory, "read") : getShellStatus().cwd || defaultCwd;
       const shell = process.platform === "win32" ? "powershell.exe" : "bash";
       const args = process.platform === "win32" ? ["-NoProfile", "-Command", command] : ["-lc", command];
       const child = spawn(shell, args, { cwd, windowsHide: true, env: process.env });

@@ -5,6 +5,9 @@ import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpServer } from "../server-factory.js";
 import { getUpstreamManager } from "./mcp-upstream-manager.js";
+import type { SkillToolOptions } from "../tools/skills.js";
+import type { DelegateToolOptions } from "../tools/delegate.js";
+import { hasHooks, runHooks } from "../hooks/engine.js";
 
 
 const DEFAULT_PROTOCOL_VERSION = "2025-03-26";
@@ -34,6 +37,8 @@ export interface SessionManagerConfig {
   workspaceRoots: string[];
   port: number;
   projectMemoryInstructions?: string;
+  skills?: SkillToolOptions;
+  delegates?: DelegateToolOptions;
 }
 
 export interface SessionManager {
@@ -150,6 +155,9 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     delete sessions[sessionId];
     delete lastTransportErrors[sessionId];
     sessionOpChains.delete(sessionId);
+    if (hasHooks("Stop")) {
+      void runHooks({ event: "Stop", sessionId }).catch(() => undefined);
+    }
     console.log(`[MCP] Session removed (${reason}): ${sessionId}`);
   }
 
@@ -164,7 +172,9 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       config.workspaceRoots,
       true,
       getUpstreamManager(),
-      config.projectMemoryInstructions
+      config.projectMemoryInstructions,
+      config.skills,
+      config.delegates
     );
 
     const transport = new StreamableHTTPServerTransport({
@@ -182,6 +192,10 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         };
         clearPendingRecovery(sid);
         console.log(`[MCP] Session initialized: ${sid}`);
+        // Lifecycle hooks are advisory: nothing here can refuse a session.
+        if (hasHooks("SessionStart")) {
+          void runHooks({ event: "SessionStart", sessionId: sid }).catch(() => undefined);
+        }
       },
       onsessionclosed: (sid) => {
         if (sid) scheduleDeleteGrace(sid);

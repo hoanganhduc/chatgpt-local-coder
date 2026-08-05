@@ -14,11 +14,13 @@
   "type": "module",
   "main": "dist/index.js",
   "bin": {
+    "chatgpt-local-coder": "dist/cli/main.js",
+    "clc": "dist/cli/main.js",
     "codex-mcp-server": "dist/index.js"
   },
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node scripts/test-patch.mjs && node scripts/test-tools.mjs && node scripts/test-checkpoints.mjs && node scripts/test-mcp-upstream.mjs && node scripts/test-activity-log.mjs && node scripts/test-project-memory.mjs && node scripts/test-tool-profile.mjs && node scripts/test-shell-persist.mjs",
+    "test": "npm run build && node scripts/test-platform.mjs && node scripts/test-config.mjs && node scripts/test-secrets.mjs && node scripts/test-permissions.mjs && node scripts/test-skills.mjs && node scripts/test-settings.mjs && node scripts/test-delegates.mjs && node scripts/test-hooks.mjs && node scripts/test-tunnel.mjs && node scripts/test-services.mjs && node scripts/test-cli.mjs && node scripts/test-patch.mjs && node scripts/test-tools.mjs && node scripts/test-checkpoints.mjs && node scripts/test-mcp-upstream.mjs && node scripts/test-activity-log.mjs && node scripts/test-project-memory.mjs && node scripts/test-tool-profile.mjs && node scripts/test-shell-persist.mjs",
     "test:all": "node scripts/run-all-tests.mjs",
     "test:integration": "npm run build && node scripts/test-mcp-bridge-integration.mjs",
     "init-claude-md": "node scripts/init-claude-md.mjs",

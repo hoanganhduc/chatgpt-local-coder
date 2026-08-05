@@ -9,7 +9,12 @@ const ROOT_MEMORY_FILES = [
   "CLAUDE.local.md",
 ] as const;
 
+// First match wins. This host's own home comes first: it is where
+// `ai-agents-skills` writes managed instruction blocks for the
+// `chatgpt-local-coder` target, and a block installed for this host should not
+// be shadowed by another agent's file.
 const USER_MEMORY_CANDIDATES = [
+  path.join(os.homedir(), ".chatgpt-local-coder", "AGENTS.md"),
   path.join(os.homedir(), ".codex", "CLAUDE.md"),
   path.join(os.homedir(), ".claude", "CLAUDE.md"),
 ] as const;

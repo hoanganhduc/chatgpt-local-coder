@@ -34,7 +34,9 @@ async function run(name, fn) {
 await fs.mkdir(tmpDir, { recursive: true });
 
 await run("glob finds typescript files", async () => {
-  const matches = await globFiles(root, "src/**/*.ts", 50);
+  // The cap has to stay ahead of the tree: filesystem.ts sorts late enough that
+  // a tight limit would drop it and fail for the wrong reason.
+  const matches = await globFiles(root, "src/**/*.ts", 500);
   if (!matches.some((m) => m.path.endsWith("filesystem.ts"))) throw new Error("filesystem.ts not found");
 });
 

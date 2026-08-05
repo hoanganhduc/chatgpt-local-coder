@@ -25,6 +25,10 @@ export const SLIM_CHATGPT_TOOLS = new Set([
   "load_path_rules",
   "rewind",
   "mcp_servers",
+  "skill_list",
+  "skill_read",
+  "skill_run",
+  "agent_delegate",
 ]);
 
 export function getChatGptToolProfile(): ToolProfileName {
