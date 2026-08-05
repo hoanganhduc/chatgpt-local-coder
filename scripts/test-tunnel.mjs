@@ -223,11 +223,37 @@ const secretValue = "sk-live-SUPER-SECRET-KEY";
 const secretFile = path.join(stubDir, "runtime.key");
 await fs.writeFile(secretFile, secretValue, "utf-8");
 
+/**
+ * `--require <path>` as NODE_OPTIONS will read it back.
+ *
+ * Node does not hand NODE_OPTIONS to a shell; it tokenises the string itself,
+ * and inside a quoted run a backslash escapes the next character. A Windows
+ * path quoted as-is therefore arrives with every separator eaten —
+ * `C:\Users\RUNNER~1\...` resolves as `C:UsersRUNNER~1...` and the preload
+ * fails with MODULE_NOT_FOUND. The quotes still have to be there for a path
+ * containing a space, so the backslashes are doubled rather than dropped. On
+ * POSIX there are none and this is a no-op.
+ */
+function requireOption(modulePath) {
+  return `--require "${modulePath.replace(/\\/g, "\\\\")}"`;
+}
+
+// Asserted on every OS: a Linux or macOS run otherwise cannot see that the
+// preload path is malformed, and every stub-backed test below silently stops
+// testing anything the moment it is.
+check("a Windows stub path survives NODE_OPTIONS tokenising", () => {
+  const option = requireOption("C:\\Users\\RUNNER~1\\AppData\\stub.cjs");
+  // Undo what Node's tokeniser does inside a quoted run: drop the quotes, then
+  // let each backslash escape the character after it.
+  const unquoted = option.slice('--require "'.length, -1).replace(/\\(.)/g, "$1");
+  assert(unquoted === "C:\\Users\\RUNNER~1\\AppData\\stub.cjs", `Node would preload ${unquoted}`);
+});
+
 /** Run one stub-backed call with a clean argv log. */
 async function withStub(mode, fn) {
   await fs.writeFile(stubLog, "", "utf-8");
   const saved = process.env.NODE_OPTIONS;
-  process.env.NODE_OPTIONS = `${saved ? `${saved} ` : ""}--require "${stubPath}"`;
+  process.env.NODE_OPTIONS = `${saved ? `${saved} ` : ""}${requireOption(stubPath)}`;
   process.env.CLC_STUB_LOG = stubLog;
   process.env.CLC_STUB_DIR = stubDir;
   process.env.CLC_STUB_LOGFILE = runtimeLog;
@@ -349,7 +375,7 @@ process.exit(0);
     "utf-8"
   );
   const saved = process.env.NODE_OPTIONS;
-  process.env.NODE_OPTIONS = `${saved ? `${saved} ` : ""}--require "${noisy}"`;
+  process.env.NODE_OPTIONS = `${saved ? `${saved} ` : ""}${requireOption(noisy)}`;
   try {
     const result = await tunnelStatus(stubOpts, "acceptance");
     assert(result.json?.healthy === true, `did not recover the JSON: ${result.stdout}`);
