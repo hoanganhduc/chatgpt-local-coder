@@ -18,6 +18,7 @@ import {
   runDelegate,
   MAX_DELEGATE_OUTPUT_BYTES,
 } from "../dist/delegates/index.js";
+import { windowsBatchInvocation } from "../dist/lib/platform.js";
 import { setPermissionContext } from "../dist/lib/permissions.js";
 import { setDefaultCwd } from "../dist/lib/path-security.js";
 
@@ -43,11 +44,13 @@ const work = path.join(tmp, "work");
 await fs.mkdir(stubDir, { recursive: true });
 await fs.mkdir(work, { recursive: true });
 
-// The stub reports the argv it was handed, so argv construction is observable.
+// The stub reports the argv, the stdin and any --prompt-file it was handed, so
+// every channel the prompt could travel on is observable.
 const stubJs = path.join(stubDir, "stub.mjs");
 await fs.writeFile(
   stubJs,
   [
+    "import fsp from 'fs/promises';",
     "const mode = process.env.STUB_MODE || 'echo';",
     "const argv = process.argv.slice(2);",
     "if (mode === 'sleep') { setTimeout(() => process.exit(0), 60000); }",
@@ -59,7 +62,18 @@ await fs.writeFile(
     // happens to split the stream on a multiple of the cap.
     "else if (mode === 'boundary') { process.stdout.write('x'.repeat(200 * 1024)); setTimeout(() => process.stdout.write('y'.repeat(1024)), 50); }",
     "else if (mode === 'fail') { process.stderr.write('stub refused'); process.exit(3); }",
-    "else { process.stdout.write(JSON.stringify({ name: process.env.STUB_NAME, argv, cwd: process.cwd() })); process.exit(0); }",
+    "else {",
+    // Every delegate spawn closes the child's stdin, including the --version
+    // probe and the delegate that reads its prompt from a file, so reading to
+    // EOF here always terminates.
+    "  let stdin = '';",
+    "  process.stdin.setEncoding('utf-8');",
+    "  for await (const chunk of process.stdin) stdin += chunk;",
+    "  const at = argv.indexOf('--prompt-file');",
+    "  const promptFile = at >= 0 ? await fsp.readFile(argv[at + 1], 'utf-8') : null;",
+    "  process.stdout.write(JSON.stringify({ name: process.env.STUB_NAME, argv, cwd: process.cwd(), stdin, promptFile }));",
+    "  process.exit(0);",
+    "}",
   ].join("\n"),
   "utf-8"
 );
@@ -132,15 +146,16 @@ await installStub("codex");
 await installStub("grok");
 await installStub("opencode");
 
-const ARGV = {
-  claude: ["-p", "PROMPT", "--output-format", "text"],
-  codex: ["exec", "PROMPT"],
-  grok: ["-p", "PROMPT"],
-  opencode: ["run", "PROMPT"],
+// Static argv only — the prompt reaches these two on stdin, never as an
+// operand, so nothing model-supplied is on the command line cmd.exe re-parses
+// when the delegate is a `.cmd` shim on Windows.
+const STDIN_ARGV = {
+  claude: ["-p", "--output-format", "text"],
+  codex: ["exec", "-"],
 };
 
-for (const [id, expected] of Object.entries(ARGV)) {
-  await checkAsync(`${id} is invoked as ${expected.join(" ")}`, async () => {
+for (const [id, expected] of Object.entries(STDIN_ARGV)) {
+  await checkAsync(`${id} is invoked as ${expected.join(" ")} with the prompt on stdin`, async () => {
     resetDelegateProbe();
     const result = await runDelegate({ prompt: "PROMPT", agent: id, timeoutSec: 30 });
     assert(result.ok === true, `failed: ${result.ok === false ? result.error : ""}`);
@@ -150,17 +165,116 @@ for (const [id, expected] of Object.entries(ARGV)) {
     const seen = JSON.parse(result.output);
     assert(seen.name === id, `stub identity: ${seen.name}`);
     assert(JSON.stringify(seen.argv) === JSON.stringify(expected), `stub argv: ${JSON.stringify(seen.argv)}`);
+    assert(seen.stdin === "PROMPT", `stub stdin: ${JSON.stringify(seen.stdin)}`);
   });
 }
 
-await checkAsync("a prompt with shell metacharacters is passed through as one argument", async () => {
+// grok has no stdin prompt mode, so it gets a file this host writes and deletes
+// again; only the generated path travels in argv.
+await checkAsync("grok is invoked as --prompt-file with the prompt in the file", async () => {
   resetDelegateProbe();
-  const nasty = 'fix "the bug"; rm -rf / && echo $HOME';
-  const result = await runDelegate({ prompt: nasty, agent: "codex", timeoutSec: 30 });
-  assert(result.ok === true, "ran");
+  const result = await runDelegate({ prompt: "PROMPT", agent: "grok", timeoutSec: 30 });
+  assert(result.ok === true, `failed: ${result.ok === false ? result.error : ""}`);
+  assert(result.args.length === 2 && result.args[0] === "--prompt-file", `args: ${JSON.stringify(result.args)}`);
+
   const seen = JSON.parse(result.output);
-  assert(seen.argv.length === 2, `argv length: ${seen.argv.length}`);
-  assert(seen.argv[1] === nasty, `prompt round-trip: ${seen.argv[1]}`);
+  assert(seen.name === "grok", `stub identity: ${seen.name}`);
+  assert(JSON.stringify(seen.argv) === JSON.stringify(result.args), `stub argv: ${JSON.stringify(seen.argv)}`);
+  assert(seen.promptFile === "PROMPT", `prompt file: ${JSON.stringify(seen.promptFile)}`);
+  assert(seen.stdin === "", `grok should get no stdin: ${JSON.stringify(seen.stdin)}`);
+
+  let stillThere = true;
+  try { await fs.access(result.args[1]); } catch { stillThere = false; }
+  assert(!stillThere, `prompt file survived the run: ${result.args[1]}`);
+});
+
+// The assertion the whole arrangement exists for. Every character below is a
+// separator, an escape or an expansion trigger for at least one of the parsers
+// a prompt can cross: sh on POSIX, and on Windows both cmd.exe (`& | < > ^ ( )
+// % !` and a bare newline) and the child's own argv parser (`"` and a trailing
+// backslash run). The canary is the assertion with teeth — a second command
+// created by either shell writes it, and its absence is observed rather than
+// inferred from the round-trip.
+const CANARY = path.join(work, "pwned.txt");
+const NASTY_PROMPT = [
+  'fix "the bug"; rm -rf / && echo $HOME',
+  `& echo pwned> "${CANARY}" & rem`,
+  `; echo pwned > "${CANARY}" ;`,
+  "| more ^ 100% %PATH% !PATH! (a) `id` $(id) > out < in C:\\dir\\",
+].join("\r\n");
+
+await checkAsync("a hostile prompt reaches every delegate whole and spawns nothing", async () => {
+  await fs.rm(CANARY, { force: true });
+
+  for (const agent of ["claude", "codex", "grok", "opencode"]) {
+    resetDelegateProbe();
+    const result = await runDelegate({ prompt: NASTY_PROMPT, agent, timeoutSec: 30 });
+
+    // opencode takes the prompt as an operand — it offers no stdin or file
+    // mode — so for it the prompt is expected in argv, and on Windows the
+    // encoder refuses a multi-line one outright because cmd.exe ends a command
+    // at a line break whatever the quoting. Refusing is the point: truncating
+    // into a command line whose tail runs unquoted would be the injection.
+    // The other three keep argv free of prompt text on every OS.
+    const viaArgv = agent === "opencode";
+
+    if (viaArgv && process.platform === "win32") {
+      assert(result.ok === false, "a multi-line argv prompt must be refused, not silently emptied");
+      assert(/newline/.test(result.error), `diagnostic should name the cause: ${result.error}`);
+      continue;
+    }
+
+    assert(result.ok === true, `${agent} failed: ${result.ok === false ? result.error : ""}`);
+
+    if (!viaArgv) {
+      for (const arg of result.args) {
+        assert(!arg.includes("rm -rf"), `${agent} put prompt text in argv: ${arg}`);
+        assert(!arg.includes("echo pwned"), `${agent} put prompt text in argv: ${arg}`);
+        // What is left is a registry literal or a path this host generated, and
+        // a cmd.exe command line can carry no newline in any of them.
+        assert(!/[\r\n]/.test(arg), `${agent} argv element is unrepresentable: ${JSON.stringify(arg)}`);
+      }
+      // The same argv, quoted for a Windows batch delegate: this must not throw,
+      // and it is the encoding the Windows CI then runs for real.
+      windowsBatchInvocation("C:\\npm\\claude.cmd", result.args, { SystemRoot: "C:\\Windows" });
+    }
+
+    // A stub that never started is not a pass: injected text would leave the
+    // JSON unparseable, but a swallowed prompt would not.
+    const seen = JSON.parse(result.output);
+    assert(seen.name === agent, `${agent} stub identity: ${seen.name}`);
+    const delivered =
+      agent === "grok" ? seen.promptFile : viaArgv ? seen.argv[seen.argv.length - 1] : seen.stdin;
+    assert(delivered === NASTY_PROMPT, `${agent} prompt round-trip differs: ${JSON.stringify(delivered)}`);
+  }
+
+  let hatched = true;
+  try { await fs.access(CANARY); } catch { hatched = false; }
+  assert(!hatched, "the prompt executed a second command");
+});
+
+// The refusal above must not be the encoder simply rejecting anything hostile:
+// a single-line prompt is the case the argv channel has to carry. The encoding
+// itself is asserted against models of both parsers in test-platform.mjs; what
+// is checked here is the delegate path end to end.
+await checkAsync("a single-line hostile prompt still reaches an argv-channel delegate", async () => {
+  await fs.rm(CANARY, { force: true });
+  const single = `fix "the bug" & echo pwned > "${CANARY}" & rem 100% %PATH% !PATH! ^ | > < C:\\dir\\`;
+
+  resetDelegateProbe();
+  const result = await runDelegate({ prompt: single, agent: "opencode", timeoutSec: 30 });
+  assert(result.ok === true, `failed: ${result.ok === false ? result.error : ""}`);
+  assert(result.args[result.args.length - 1] === single, `argv: ${JSON.stringify(result.args)}`);
+
+  // Accepted rather than refused, and this is the encoding Windows CI then runs.
+  windowsBatchInvocation("C:\\npm\\opencode.cmd", result.args, { SystemRoot: "C:\\Windows" });
+
+  const seen = JSON.parse(result.output);
+  assert(seen.argv[seen.argv.length - 1] === single, `stub argv: ${JSON.stringify(seen.argv)}`);
+
+  let hatched = true;
+  try { await fs.access(CANARY); } catch { hatched = false; }
+  assert(!hatched, "the prompt executed a second command");
 });
 
 await checkAsync("the first available CLI in order wins when none is named", async () => {

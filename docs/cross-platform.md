@@ -92,6 +92,61 @@ The access check cannot carry the weight it does on POSIX:
 `fs.constants.F_OK`)", so it is the extension list, not the file mode, that
 decides whether a match counts as executable.
 
+### Batch files on Windows
+
+An npm-installed CLI is a `.cmd` shim on Windows, so every delegate — `claude`,
+`codex`, `grok`, `opencode` — resolves to a batch file there and to an ordinary
+executable on macOS and Linux. Windows cannot start a batch file directly: only
+cmd.exe can read one, and since the CVE-2024-27980 fix (Node 18.20.2 / 20.12.2)
+`child_process.spawn` refuses a `.bat`/`.cmd` target with `EINVAL` unless a shell
+is asked for. Before this was handled, `runExecutable` caught that throw and
+returned an empty result with a null exit code, which is what the Windows CI jobs
+were reporting.
+
+`shell: true` is not the answer. It joins argv into one string and hands it to
+cmd.exe unquoted, so any `& | < > ^ " %` in an argument becomes cmd.exe syntax.
+`runExecutable` instead spawns cmd.exe itself, with
+`windowsVerbatimArguments: true` and a command line quoted by
+`windowsBatchInvocation` in `src/lib/platform.ts`. That quoting satisfies both
+parsers that read the line — cmd.exe first, then the child's C runtime — and it
+follows the Rust standard library's rule for the same problem: `"` is doubled,
+a run of backslashes is doubled before a quote and before the closing quote, and
+`%` is written `%%cd:~,%`, which cmd.exe expands to nothing so no variable
+expansion survives. CR, LF and `0x1A` end a cmd.exe command wherever they appear
+and cannot be quoted at all, so an argument containing one is refused with an
+error rather than encoded.
+
+Where possible the quoting is a second line of defence rather than the first,
+because the prompt is kept off the command line entirely — see `promptVia` in
+`src/delegates/registry.ts`:
+
+| Delegate | Prompt channel | Why |
+|---|---|---|
+| `claude` | stdin | `-p` is a flag; with no operand the CLI reads stdin |
+| `codex` | stdin | `codex exec -` reads instructions from stdin |
+| `grok` | `0600` temp file | no stdin prompt mode; `--prompt-file <path>` takes a path |
+| `opencode` | argv | takes the message as an operand and offers neither channel |
+
+`opencode` is the exception, and it carries a Windows-only limitation as a
+result: because CR and LF cannot be encoded into a cmd.exe command line at all,
+a **multi-line prompt to `opencode` is refused on Windows**. It is reported as a
+failed delegation naming the cause, not silently truncated — a truncated command
+line would run its tail unquoted, which is the injection this all exists to
+prevent. The other three delegates take multi-line prompts on every OS, so
+prefer them on Windows, or keep an `opencode` prompt to a single line.
+
+A delegate that never starts is now reported as a failure rather than as a
+success with empty output (`spawnFailed` on `RunResult`). The two are
+indistinguishable otherwise — both are a null exit code and an empty stdout —
+and treating the first as the second is precisely what kept the Windows defect
+invisible while `agent_delegate` reported `ok: true`.
+
+`windowsBatchInvocation` is exported and exercised by `scripts/test-platform.mjs`
+on every OS, because a Linux or macOS developer cannot otherwise reproduce any
+of this. `scripts/test-platform.mjs` additionally runs a real npm-shaped `.cmd`
+shim end to end on Windows, with a canary file that a leaked separator would
+create.
+
 ---
 
 ## 4. Background service
