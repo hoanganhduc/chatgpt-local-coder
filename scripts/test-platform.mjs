@@ -209,25 +209,38 @@ await fsp.writeFile(
     "const [, self, pidFile, mode] = process.argv;",
     "",
     "// `inherit` hands the next process the very pipe this one was given, so the",
-    "// pipe outlives whoever started it.",
-    "const spawnSelf = (next, opts) =>",
-    '  spawn(process.execPath, [self, pidFile, next], { stdio: "inherit", ...opts });',
+    "// pipe outlives whoever started it. The pid is recorded by whoever spawns the",
+    "// leaf rather than by the leaf itself: the caller reads the file as soon as",
+    "// the run settles, and a leaf that has to boot a Node runtime first has not",
+    "// written it by then.",
+    "const spawnSelf = (next, opts) => {",
+    '  const child = spawn(process.execPath, [self, pidFile, next], { stdio: "inherit", ...opts });',
+    '  if (next === "leaf") fs.writeFileSync(pidFile, String(child.pid));',
+    "  return child;",
+    "};",
     "",
     "// The long-lived process every case below is really about.",
-    'if (mode === "leaf") { fs.writeFileSync(pidFile, String(process.pid)); setTimeout(() => {}, 25000); }',
+    'if (mode === "leaf") setTimeout(() => {}, 25000);',
     "",
     "// Stays alive itself, so the run times out with the leaf still under it.",
     'else if (mode === "hold") { spawnSelf("leaf"); setTimeout(() => {}, 25000); }',
     "",
-    "// Also stays alive, but the leaf is started one level down by a process that",
+    "// Also stays alive, but the leaf is started one level down by a relay that",
     "// leaves at once — so the leaf reparents to init long before the timeout. A",
     "// tree walked from this pid would no longer find it; the process group it",
     "// stays in still reaches it.",
-    'else if (mode === "reparent") { spawnSelf("daemon"); setTimeout(() => {}, 25000); }',
+    'else if (mode === "reparent") { spawnSelf("relay"); setTimeout(() => {}, 25000); }',
+    'else if (mode === "relay") { spawnSelf("leaf").unref(); process.exit(0); }',
     "",
     "// Daemonises: leaves the leaf running and exits 0 straight away, the shape a",
     "// launcher takes. Nothing has timed out, so nothing should be killed.",
-    'else if (mode === "daemon") { spawnSelf("leaf").unref(); process.exit(0); }',
+    "//",
+    "// Detached on Windows, and not to escape anything this host does: libuv puts",
+    "// every child in a job object killed when the parent exits, so a launcher",
+    "// there has to break away for its daemon to outlive it at all. On POSIX the",
+    "// leaf stays in the group the timeout would kill, which is what makes `it was",
+    "// left alone` worth asserting.",
+    'else if (mode === "daemon") { spawnSelf("leaf", { detached: process.platform === "win32" }).unref(); process.exit(0); }',
     "",
     "// `detached` is setsid: the leaf leads a process group of its own, so the",
     "// group kill cannot reach it and it holds the pipe open through the timeout.",
@@ -280,7 +293,9 @@ try {
 } catch (e) { fail("timeout kills the tree", e.message); }
 
 try {
-  const { leaf, cleanup } = await runTreeCase("reparent");
+  // A longer timeout than the case above needs: the leaf is two Node startups
+  // down, and killing the tree before it exists would prove nothing.
+  const { leaf, cleanup } = await runTreeCase("reparent", { timeoutMs: 3000 });
   const gone = await reaped(leaf);
   cleanup();
   if (!gone) throw new Error(`reparented leaf ${leaf} outlived the timeout`);

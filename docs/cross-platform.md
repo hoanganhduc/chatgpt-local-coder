@@ -226,6 +226,18 @@ something running now reports exit 0 promptly rather than being killed at its
 timeout, because nothing timed out. That is what a launcher is for. A command
 that has not exited is still killed by the timeout, group and all.
 
+Windows arrives at the same behaviour by another route, and the difference
+shaped the test. There `close` fires when the process does — a handle a
+surviving descendant inherited does not hold the parent's read end open — so the
+drain deadline is a POSIX safeguard Windows rarely reaches. What Windows adds is
+libuv's job object: a child it spawns is killed when its parent exits unless it
+was detached. That applies to a Node process started by another Node process and
+not to something a shell launched, which breaks away silently, so it changes no
+`run_command` behaviour — but it does mean the daemonising fixture has to detach
+on Windows to leave a daemon there to observe at all. On POSIX it deliberately
+does not: staying in the group the timeout would have killed is what makes
+"nothing killed it" an assertion rather than an accident.
+
 What a killed process reports differs too, and one place cared. A `PreToolUse`
 hook blocks the call by exiting non-zero, and a hook killed for overrunning its
 timeout has decided nothing and must not block. POSIX makes that easy to get
