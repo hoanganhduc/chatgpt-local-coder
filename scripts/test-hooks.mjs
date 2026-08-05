@@ -19,7 +19,7 @@ import {
 } from "../dist/hooks/engine.js";
 import { matchesTool, resetMatcherCache } from "../dist/hooks/matchers.js";
 import { applyHookWrapper } from "../dist/hooks/wrap.js";
-import { registerPostEditHook } from "../dist/lib/post-edit-hooks.js";
+import { registerPostEditHook, runPostEditHooks } from "../dist/lib/post-edit-hooks.js";
 import { toolResult } from "../dist/lib/tool-result.js";
 import { setPermissionContext } from "../dist/lib/permissions.js";
 import { setDefaultCwd } from "../dist/lib/path-security.js";
@@ -364,6 +364,37 @@ await checkAsync("post-edit checks are skipped on a dry run", async () => {
   }
 });
 
+await checkAsync("a post-edit check that overruns its timeout is reported and leaves nothing running", async () => {
+  resetHooks();
+  const target = path.join(tmp, "slow.ts");
+  await fs.writeFile(target, "const x = 1;\n", "utf-8");
+
+  const hooksConfig = path.join(tmp, "slow-post-edit.json");
+  await fs.writeFile(
+    hooksConfig,
+    JSON.stringify({ enabled: true, hooks: [{ glob: "*.ts", command: sleepCmd, timeout_ms: 1000 }] }),
+    "utf-8"
+  );
+  process.env.POST_EDIT_HOOKS_CONFIG = hooksConfig;
+
+  try {
+    const started = Date.now();
+    const out = await runPostEditHooks([target]);
+    const elapsed = Date.now() - started;
+    const report = out.post_edit_hooks[0];
+    assert(report.exit_code === null, `a killed check decided nothing: ${JSON.stringify(report)}`);
+    assert(report.stderr === "hook timeout", `stderr: ${JSON.stringify(report.stderr)}`);
+    // The kill is awaited before the promise settles, so returning at all means
+    // the tree is gone rather than merely signalled. Without that a check that
+    // ran to completion in the background would still hold this directory open,
+    // which on Windows is what left the fixture unremovable.
+    assert(elapsed < 20_000, `should return near its 1s timeout, not run to completion: ${elapsed}ms`);
+  } finally {
+    delete process.env.POST_EDIT_HOOKS_CONFIG;
+    clearInternalHooks();
+  }
+});
+
 await checkAsync("post-edit checks do not fire for a read", async () => {
   resetHooks();
   process.env.POST_EDIT_HOOKS_CONFIG = path.join(tmp, "post-edit.json");
@@ -379,6 +410,26 @@ await checkAsync("post-edit checks do not fire for a read", async () => {
 
 resetHooks();
 setPermissionContext({ profile: "workspace", roots: [process.cwd()] });
-await fs.rm(tmp, { recursive: true, force: true });
+
+// A hook that outlives the test that started it keeps its cwd open, and on
+// Windows that alone makes rmdir fail with EBUSY — which is how a leaked child
+// first showed up here. Worth failing on, so it is asserted rather than
+// swallowed by `force`, and asserted as a named check rather than left to throw
+// out of the teardown: an uncaught EBUSY after the summary line reports every
+// test as passing and the job as failed, attributing the leak to nothing.
+// Retried because Windows closes a handle asynchronously, so the directory can
+// stay busy for a moment after the process holding it is already gone.
+await checkAsync("the fixture directory is released once the hooks have run", async () => {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      await fs.rm(tmp, { recursive: true, force: true });
+      return;
+    } catch (error) {
+      if (attempt >= 20) throw new Error(`${tmp} is still held: ${error.code || error.message}`);
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+  }
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

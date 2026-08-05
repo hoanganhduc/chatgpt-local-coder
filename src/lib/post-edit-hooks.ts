@@ -13,6 +13,7 @@ import path from "path";
 import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { registerInternalHook } from "../hooks/engine.js";
+import { killProcessTree } from "./platform.js";
 
 export interface PostEditHook {
   glob: string;
@@ -59,15 +60,37 @@ function runHook(command: string, filePath: string, timeoutMs: number): Promise<
     const child = spawn(shell, args, { cwd: path.dirname(filePath), windowsHide: true });
     let stdout = "";
     let stderr = "";
+
+    // Close stdin at once. Spawning gives the child a pipe nobody here ever
+    // writes to, so a hook that reads stdin at all blocks on it until its
+    // timeout — which is how `echo checked <path>` intermittently took the full
+    // 10s under PowerShell on CI and returned nothing. Every other spawn in
+    // this host already ends stdin; this one did not. A hook that ignores stdin
+    // sees the same EOF a closed handle would have given it.
+    child.stdin?.on("error", () => undefined);
+    child.stdin?.end();
+
+    let timedOut = false;
     const timer = setTimeout(() => {
-      child.kill();
-      resolve({ stdout, stderr: stderr || "hook timeout", exit_code: null });
+      timedOut = true;
+      // The whole tree, not just the shell: a surviving grandchild keeps
+      // `cwd` open, and on Windows that is enough to make a later rmdir of
+      // that directory fail with EBUSY. Settled only once the kill is done, so
+      // returning means the handle is gone rather than merely signalled.
+      void killProcessTree(child.pid ?? 0).then(() => {
+        resolve({ stdout, stderr: stderr || "hook timeout", exit_code: null });
+      });
     }, timeoutMs);
 
     child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
     child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
     child.on("close", (code) => {
       clearTimeout(timer);
+      // The kill itself closes the child, and that fires here first. Reporting
+      // it would describe a timed-out check as an ordinary one killed by a
+      // signal — the same "hook timeout" marker the caller reads, dropped — so
+      // the timeout path is left to settle instead.
+      if (timedOut) return;
       resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code });
     });
     child.on("error", () => {
