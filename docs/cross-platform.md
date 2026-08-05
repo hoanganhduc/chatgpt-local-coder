@@ -147,6 +147,21 @@ of this. `scripts/test-platform.mjs` additionally runs a real npm-shaped `.cmd`
 shim end to end on Windows, with a canary file that a leaked separator would
 create.
 
+### Killing a timed-out child on Windows
+
+Windows has no process groups to signal, so `killProcessTree` walks the tree with
+`taskkill /T /F` where POSIX sends a signal to the negative pid. Both stock tools
+this host spawns — `cmd.exe` and `taskkill.exe` — are resolved to an absolute
+path under `%SystemRoot%\System32`, never launched by bare name: libuv resolves a
+Windows child from `PATH` alone and does not fall back to the System32 lookup
+`CreateProcess` performs on its own. Spawned by name under a narrowed `PATH` the
+kill fails with `ENOENT`, and because the failure was discarded the run reported
+`timedOut: true` while the child kept going — a delegate that outlives its
+timeout with nothing left to stop it. POSIX never showed this, `process.kill`
+being a syscall that consults no `PATH`. If `taskkill` fails anyway the host
+falls back to terminating the process itself, which does not reach its children
+but is not nothing.
+
 ---
 
 ## 4. Background service

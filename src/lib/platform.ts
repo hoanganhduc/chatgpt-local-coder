@@ -145,9 +145,26 @@ export async function killProcessTree(pid: number): Promise<void> {
   if (!pid || pid <= 0) return;
 
   if (isWindows()) {
-    await new Promise<void>((resolve) => {
-      execFile("taskkill", ["/PID", String(pid), "/T", "/F"], () => resolve());
+    // Windows has no process groups to signal, so the tree is walked by
+    // taskkill. Spawned by absolute path: this runs with whatever env the host
+    // has, and a caller that narrowed PATH would otherwise get a silent ENOENT
+    // here and a child that outlives its timeout.
+    const failed = await new Promise<boolean>((resolve) => {
+      execFile(systemTool("taskkill.exe", process.env), ["/PID", String(pid), "/T", "/F"], (error) =>
+        resolve(Boolean(error))
+      );
     });
+    // taskkill also reports failure for a pid that already exited, so the
+    // fallback has to tolerate a process that is simply gone. It reaches only
+    // the process itself, not its children, which is still better than the
+    // nothing-at-all this used to do.
+    if (failed) {
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch {
+        /* already gone, or not ours to kill */
+      }
+    }
     return;
   }
 
@@ -248,12 +265,23 @@ const BATCH_UNREPRESENTABLE = /[\r\n\u001a]/;
 /** cmd.exe truncates its command line at 8191 characters. */
 const MAX_BATCH_COMMAND_LINE = 8000;
 
+/**
+ * Absolute path to a stock Windows tool.
+ *
+ * Never spawn one of these by bare name. libuv resolves a Windows child from
+ * PATH alone — it does not fall back to the System32 lookup CreateProcess does
+ * on its own — so a caller that narrows PATH makes the spawn fail with ENOENT.
+ */
+function systemTool(name: string, env: NodeJS.ProcessEnv): string {
+  return path.win32.join(env.SystemRoot || env.windir || "C:\\Windows", "System32", name);
+}
+
 /** Which cmd.exe to run. Only a real cmd.exe understands the switches and the
  * `%%cd:~,%` escape below, so a `ComSpec` naming anything else is ignored. */
 function comSpec(env: NodeJS.ProcessEnv): string {
   const configured = (env.ComSpec || env.COMSPEC || "").trim();
   if (configured && path.win32.basename(configured).toLowerCase() === "cmd.exe") return configured;
-  return path.win32.join(env.SystemRoot || env.windir || "C:\\Windows", "System32", "cmd.exe");
+  return systemTool("cmd.exe", env);
 }
 
 export interface BatchInvocation {

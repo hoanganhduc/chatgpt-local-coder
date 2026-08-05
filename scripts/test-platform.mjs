@@ -122,6 +122,30 @@ try {
   ok("defaultShell actually executes a command on this host");
 } catch (e) { fail("defaultShell execution", e.message); }
 
+try {
+  // A timeout has to kill the child even when the host's PATH cannot resolve a
+  // helper. Windows has no process group to signal, so the tree is walked by
+  // taskkill; spawned by bare name that lookup went through PATH, and libuv
+  // does not fall back to System32 the way CreateProcess does. With PATH
+  // narrowed the kill failed with ENOENT, the failure was swallowed, and the
+  // child ran to completion with `timedOut` reported as true — a runaway
+  // delegate that nothing stopped. POSIX never saw it: process.kill is a
+  // syscall and consults no PATH.
+  const stripped = { ...process.env };
+  for (const key of Object.keys(stripped)) if (key.toLowerCase() === "path") delete stripped[key];
+
+  const started = Date.now();
+  const result = await runExecutable(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+    env: stripped,
+    timeoutMs: 1000,
+  });
+  const elapsed = Date.now() - started;
+  if (result.timedOut !== true) throw new Error("timeout not flagged");
+  if (result.spawnFailed) throw new Error("the child never started, so nothing was killed");
+  if (elapsed > 20000) throw new Error(`child outlived its timeout: ${elapsed}ms`);
+  ok("a child that overruns its timeout is killed even when PATH is empty");
+} catch (e) { fail("timeout kill without PATH", e.message); }
+
 // ------------------------------------------------- Windows batch command line
 //
 // Windows cannot start a `.cmd`/`.bat` itself, and an npm-installed CLI is one,
