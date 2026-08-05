@@ -2,6 +2,7 @@
  * Verify the platform adapter reports this host correctly and produces a
  * runnable shell spec on every supported OS.
  */
+import { spawn } from "child_process";
 import fsp from "fs/promises";
 import os from "os";
 import path from "path";
@@ -145,6 +146,134 @@ try {
   if (elapsed > 20000) throw new Error(`child outlived its timeout: ${elapsed}ms`);
   ok("a child that overruns its timeout is killed even when PATH is empty");
 } catch (e) { fail("timeout kill without PATH", e.message); }
+
+// ------------------------------------------------------- killing a whole tree
+//
+// A timeout is only a bound if it reaches everything the command started.
+// `runExecutable` settles on `close`, which waits for the stdio pipes as well
+// as the process, so a descendant holding the inherited stdout keeps the
+// promise pending for as long as it runs — the timeout stops being a limit and
+// becomes a flag. The fixtures below are written in Node rather than shell so
+// the same tree exists on every supported OS.
+
+const treeDir = await fsp.mkdtemp(path.join(os.tmpdir(), "clc-tree-"));
+const spawner = path.join(treeDir, "spawner.mjs");
+await fsp.writeFile(
+  spawner,
+  [
+    'import { spawn } from "child_process";',
+    'import fs from "fs";',
+    "const [, , pidFile, mode] = process.argv;",
+    "// `inherit` hands the descendant the very pipe this process was given.",
+    'const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 25000)"], { stdio: "inherit" });',
+    "fs.writeFileSync(pidFile, String(child.pid));",
+    "// `orphan` leaves at once, so the descendant reparents to init long before",
+    "// the timeout — a tree walked from the child pid would find nothing, while",
+    "// the process group it stays in still reaches it.",
+    'if (mode === "orphan") { child.unref(); process.exit(0); }',
+    "setTimeout(() => {}, 25000);",
+  ].join("\n"),
+  "utf-8"
+);
+
+function isAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+async function runTreeCase(mode) {
+  const pidFile = path.join(treeDir, `${mode}.pid`);
+  const started = Date.now();
+  const pending = runExecutable(process.execPath, [spawner, pidFile, mode], { timeoutMs: 1000 });
+  const outcome = await Promise.race([
+    pending.then((result) => ({ result })),
+    new Promise((resolve) => setTimeout(() => resolve(null), 15000)),
+  ]);
+  const elapsed = Date.now() - started;
+  const descendant = Number(await fsp.readFile(pidFile, "utf-8").catch(() => "0"));
+  // Whatever the verdict, do not leave a 25s process behind for the next test.
+  const cleanup = () => { if (descendant) { try { process.kill(descendant, "SIGKILL"); } catch { /* gone */ } } };
+
+  if (!outcome) {
+    cleanup();
+    throw new Error(`never settled: a descendant held the stdout pipe for the full ${elapsed}ms`);
+  }
+  if (!descendant) { cleanup(); throw new Error("fixture never recorded a descendant pid"); }
+  if (elapsed > 10000) { cleanup(); throw new Error(`settled far past its 1s timeout: ${elapsed}ms`); }
+
+  // The kill is signalled, not awaited by runExecutable, so allow it a moment.
+  for (let attempt = 0; attempt < 20 && isAlive(descendant); attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  const survived = isAlive(descendant);
+  cleanup();
+  if (survived) throw new Error(`descendant ${descendant} outlived the timeout that killed its parent`);
+  return outcome.result;
+}
+
+try {
+  const result = await runTreeCase("hold");
+  if (result.timedOut !== true) throw new Error("timeout not flagged");
+  ok("a timed-out command is killed along with the descendants it started");
+} catch (e) { fail("timeout kills the tree", e.message); }
+
+try {
+  await runTreeCase("orphan");
+  ok("a descendant already reparented to init is still reached by the timeout");
+} catch (e) { fail("timeout kills a reparented descendant", e.message); }
+
+await fsp.rm(treeDir, { recursive: true, force: true });
+
+// Detaching a child is what gives it a process group to kill, and it is also
+// what takes it out of the terminal's foreground group — so Ctrl+C stops
+// reaching it. The signal has to be forwarded by hand, and this is the check
+// that says so: without the forwarding, interrupting the CLI leaves whatever it
+// was running alive. Windows is exempt because nothing is detached there, so
+// there is no group for a console Ctrl+C to miss.
+if (!isWindows()) {
+  const signalDir = await fsp.mkdtemp(path.join(os.tmpdir(), "clc-signal-"));
+  try {
+    const pidFile = path.join(signalDir, "child.pid");
+    const hostFile = path.join(signalDir, "host.mjs");
+    await fsp.writeFile(
+      hostFile,
+      [
+        `import { runExecutable } from ${JSON.stringify(new URL("../dist/lib/platform.js", import.meta.url).href)};`,
+        "const [, , pidFile] = process.argv;",
+        "await runExecutable(",
+        "  process.execPath,",
+        '  ["-e", \'require("fs").writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => {}, 25000);\', pidFile],',
+        "  { timeoutMs: 25000 }",
+        ");",
+      ].join("\n"),
+      "utf-8"
+    );
+
+    // The host leads its own group so the interrupt can be delivered the way a
+    // terminal delivers Ctrl+C — to the whole foreground group, not to one pid.
+    // Signalling the host alone would prove nothing: it never reached the child
+    // that way, before this change or after it.
+    const host = spawn(process.execPath, [hostFile, pidFile], { stdio: "ignore", detached: true });
+    let child = 0;
+    for (let attempt = 0; attempt < 100 && !child; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      child = Number(await fsp.readFile(pidFile, "utf-8").catch(() => "0"));
+    }
+    if (!child) throw new Error("the host never started a child to interrupt");
+
+    process.kill(-host.pid, "SIGINT");
+    for (let attempt = 0; attempt < 30 && isAlive(child); attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    const survived = isAlive(child);
+    if (survived) try { process.kill(child, "SIGKILL"); } catch { /* gone */ }
+    if (survived) throw new Error(`child ${child} survived the interrupt that stopped its host`);
+    ok("interrupting the host kills the children it spawned");
+  } catch (e) {
+    fail("SIGINT reaches spawned children", e.message);
+  } finally {
+    await fsp.rm(signalDir, { recursive: true, force: true });
+  }
+}
 
 // ------------------------------------------------- Windows batch command line
 //

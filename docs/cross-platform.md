@@ -162,6 +162,35 @@ being a syscall that consults no `PATH`. If `taskkill` fails anyway the host
 falls back to terminating the process itself, which does not reach its children
 but is not nothing.
 
+### Killing a timed-out child on POSIX
+
+The negative pid `killProcessTree` signals is a process group, and a child only
+leads one if it was spawned `detached`. That spawn flag was written but never
+applied, so the kill fell through to the direct child and the descendants it had
+started kept running. The cost was larger than a leaked process: `runExecutable`
+settles on `close`, which waits for the stdio pipes as well as the process, and a
+surviving descendant holds the inherited stdout open. A command whose children
+outlived it left the promise pending — the timeout was a flag rather than a
+bound, and a `PreToolUse` hook could stall a tool call past `HOOK_BUDGET_MS`
+without limit. Children are now spawned detached on POSIX, where the flag is
+`setsid(2)`; on Windows it is a no-op, `taskkill /T` already walking the tree.
+
+Detaching costs the other half of `setsid`. A child in its own group is no longer
+in the terminal's foreground group, so the `SIGINT` a terminal delivers on Ctrl+C
+stops reaching it, and an interrupted CLI would leave its work running and
+reparented to init. `SIGINT` and `SIGTERM` are therefore forwarded explicitly to
+every live child group. Listening for those signals suppresses Node's default of
+terminating on them, so when nothing else is listening the default is restored by
+hand rather than left off. The regression test drives a real process group rather
+than signalling a single pid, since signalling the host alone never reached the
+child either way and would prove nothing.
+
+Two shapes still outlive this. A descendant that calls `setsid` itself leaves the
+group deliberately, and a launcher that daemonises and exits 0 is never killed at
+all because nothing timed out. Both would need `runExecutable` to settle on
+`exit` with a separate deadline for draining stdio, which is a wider change than
+the spawn flag.
+
 What a killed process reports differs too, and one place cared. A `PreToolUse`
 hook blocks the call by exiting non-zero, and a hook killed for overrunning its
 timeout has decided nothing and must not block. POSIX makes that easy to get

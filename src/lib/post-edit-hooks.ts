@@ -14,7 +14,7 @@ import { spawn } from "child_process";
 import { fileURLToPath } from "url";
 import { registerInternalHook } from "../hooks/engine.js";
 import { requireCommandAllowed } from "./permissions.js";
-import { killProcessTree } from "./platform.js";
+import { detachedSpawnOptions, killProcessTree, trackChild } from "./platform.js";
 
 export interface PostEditHook {
   glob: string;
@@ -104,8 +104,11 @@ function runHook(
     const child = spawn(shell, args, {
       cwd: path.dirname(filePath),
       env: { ...process.env, [HOOK_PATH_VAR]: filePath },
-      windowsHide: true,
+      // Detached, so the kill below reaches the whole tree and not just the
+      // shell that leads it.
+      ...detachedSpawnOptions(),
     });
+    const untrack = trackChild(child.pid);
     let stdout = "";
     let stderr = "";
 
@@ -126,6 +129,7 @@ function runHook(
       // that directory fail with EBUSY. Settled only once the kill is done, so
       // returning means the handle is gone rather than merely signalled.
       void killProcessTree(child.pid ?? 0).then(() => {
+        untrack();
         resolve({ stdout, stderr: stderr || "hook timeout", exit_code: null });
       });
     }, timeoutMs);
@@ -139,10 +143,12 @@ function runHook(
       // signal — the same "hook timeout" marker the caller reads, dropped — so
       // the timeout path is left to settle instead.
       if (timedOut) return;
+      untrack();
       resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code });
     });
     child.on("error", () => {
       clearTimeout(timer);
+      untrack();
       resolve({ stdout: "", stderr: "hook spawn failed", exit_code: 1 });
     });
   });

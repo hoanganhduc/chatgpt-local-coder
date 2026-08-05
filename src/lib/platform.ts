@@ -140,6 +140,59 @@ export function detachedSpawnOptions(): { detached: boolean; windowsHide: boolea
   return { detached: !isWindows(), windowsHide: true };
 }
 
+/** Process groups this host has started and not yet seen exit. */
+const liveChildren = new Set<number>();
+let forwardingSignals = false;
+
+/**
+ * Pass an interrupt on to the children this host started.
+ *
+ * Detaching a child is what gives it a process group to kill, and it is equally
+ * what takes it out of the terminal's foreground group — so a Ctrl+C that used
+ * to reach it no longer does. Forwarding by hand is the other half of that
+ * trade: without it, interrupting the CLI leaves whatever it was running alive
+ * and reparented to init.
+ *
+ * Windows detaches nothing, so a console Ctrl+C still reaches the whole console
+ * group there and none of this applies.
+ */
+function installSignalForwarding(): void {
+  if (forwardingSignals || isWindows()) return;
+  forwardingSignals = true;
+
+  for (const signal of ["SIGINT", "SIGTERM"] as const) {
+    process.on(signal, () => {
+      for (const pid of liveChildren) {
+        try {
+          process.kill(-pid, signal);
+        } catch {
+          /* already gone, or never became a group leader */
+        }
+      }
+      // Listening for these at all suppresses Node's default of terminating on
+      // them. Whatever else listens owns the shutdown; when nothing does, the
+      // default has to be put back by hand or an interrupted CLI would forward
+      // the signal and then carry on running.
+      if (process.listenerCount(signal) === 1) {
+        process.removeAllListeners(signal);
+        process.kill(process.pid, signal);
+      }
+    });
+  }
+}
+
+/**
+ * Record a spawned child for the duration of its life. Returns the function
+ * that forgets it again, which every exit path must call — a pid left behind
+ * here would eventually be signalled after the kernel had reused it.
+ */
+export function trackChild(pid: number | undefined): () => void {
+  if (!pid) return () => undefined;
+  installSignalForwarding();
+  liveChildren.add(pid);
+  return () => liveChildren.delete(pid);
+}
+
 /** Kill a process and everything it started. Never throws. */
 export async function killProcessTree(pid: number): Promise<void> {
   if (!pid || pid <= 0) return;
@@ -386,7 +439,13 @@ export function runExecutable(
         : spawn(command, args, {
             cwd: opts.cwd,
             env: opts.env ?? process.env,
-            windowsHide: true,
+            // Detached, so the child leads a process group and `killProcessTree`
+            // can reach everything it started. Without it the timeout is not a
+            // bound at all: this promise settles on `close`, which waits for the
+            // stdio pipes, and a surviving descendant holds the inherited stdout
+            // open for as long as it runs. No-op on Windows, where the tree is
+            // walked by taskkill instead.
+            ...detachedSpawnOptions(),
           });
     } catch (error) {
       resolve({
@@ -403,6 +462,7 @@ export function runExecutable(
     let stderr = "";
     let timedOut = false;
     let settled = false;
+    const untrack = trackChild(child.pid);
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -412,6 +472,7 @@ export function runExecutable(
     const finish = (exitCode: number | null, spawnFailed = false) => {
       if (settled) return;
       settled = true;
+      untrack();
       clearTimeout(timer);
       resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exitCode, timedOut, spawnFailed });
     };
