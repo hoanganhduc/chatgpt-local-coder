@@ -559,17 +559,31 @@ export function runExecutable(
     /**
      * Keep up to `maxOutput` and drop the rest, without ever stopping reading:
      * a stream left unread fills its pipe and blocks the writer, so a command
-     * that printed too much would hang rather than be truncated. Past the cap a
-     * chunk is dropped whole rather than sliced, which is also what keeps a
-     * multi-byte character from being cut in half at the boundary — so the kept
-     * text can overshoot by one chunk, and does so deliberately.
+     * that printed too much would hang rather than be truncated.
+     *
+     * The cap is applied inside a chunk and not only between chunks. A chunk is
+     * however much the OS had ready, not a fixed size: Linux hands over 64KB at
+     * a time and Windows will hand over megabytes, so refusing the *next* chunk
+     * bounded nothing when the first one was already 3MB — which is exactly the
+     * case the cap exists for, on the platform where it went unenforced.
      */
     const capture = (key: "stdout" | "stderr") => (chunk: Buffer) => {
-      if (captured[key].length >= maxOutput) {
+      const room = maxOutput - captured[key].length;
+      if (room <= 0) {
         dropped[key] = true;
         return;
       }
-      captured[key] += chunk.toString();
+      const text = chunk.toString();
+      if (text.length <= room) {
+        captured[key] += text;
+        return;
+      }
+      // Cutting at an arbitrary index can leave the first half of a character
+      // behind, and half of one is not worth the byte it saves.
+      const kept = text.slice(0, room);
+      const last = kept.charCodeAt(kept.length - 1);
+      captured[key] += last >= 0xd800 && last <= 0xdbff ? kept.slice(0, -1) : kept;
+      dropped[key] = true;
     };
 
     child.stdout?.on("data", capture("stdout"));

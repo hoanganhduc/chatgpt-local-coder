@@ -72,9 +72,12 @@ try {
     if (made.exit_code !== 0) throw new Error(`commit: ${made.stderr}`);
 
     const log = await runGit(["log", "-1", "--format=%B"], repo);
-    // The cap is 2 MB and a chunk past it is dropped whole rather than sliced,
-    // so the kept text can overshoot by one chunk and no further.
-    if (log.stdout.length > 2_200_000) throw new Error(`kept ${log.stdout.length} chars of a 3MB message`);
+    // The cap is 2 MB and the allowance here is thousands of characters, not a
+    // chunk's worth. A cap enforced only between chunks passes a loose bound on
+    // Linux, where a pipe arrives in 64KB pieces, while keeping a 3MB Windows
+    // chunk whole — so a loose bound would have made this a Windows-only test
+    // that nobody watching Linux ever sees break.
+    if (log.stdout.length > 2_005_000) throw new Error(`kept ${log.stdout.length} chars of a 3MB message`);
     if (!/truncated/.test(log.stdout)) throw new Error("truncation happened without saying so");
   });
 
