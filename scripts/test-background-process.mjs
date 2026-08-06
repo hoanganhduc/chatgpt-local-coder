@@ -8,6 +8,7 @@
  * would run before the assignment and write into the repository instead.
  */
 import fs from "fs/promises";
+import net from "net";
 import os from "os";
 import path from "path";
 
@@ -66,8 +67,61 @@ await fs.writeFile(
   "utf-8"
 );
 
+/**
+ * The same job shape as above, holding the thing a user actually notices: a TCP
+ * port. A pid that outlives its stop is the mechanism; a port that stays taken
+ * is the complaint, and only one of the two is visible from outside.
+ *
+ * The server picks port 0 and reports back what it was given, so parallel jobs
+ * on one runner cannot collide over a fixed number.
+ */
+const portServer = path.join(tmp, "port-server.mjs");
+await fs.writeFile(
+  portServer,
+  [
+    'import http from "http";',
+    'import fs from "fs";',
+    "const [, , portFile] = process.argv;",
+    'const server = http.createServer((_, res) => res.end("ok"));',
+    'server.listen(0, "127.0.0.1", () => fs.writeFileSync(portFile, String(server.address().port)));',
+    "// A listening server stays alive on its own, so it needs a way out of its",
+    "// own accord: a stop that failed must not leave a port held until reboot.",
+    "setTimeout(() => process.exit(0), 60000);",
+  ].join("\n"),
+  "utf-8"
+);
+
+const portLauncher = path.join(tmp, "port-launcher.mjs");
+await fs.writeFile(
+  portLauncher,
+  [
+    'import { spawn } from "child_process";',
+    "const [, , portFile] = process.argv;",
+    "// Detached on Windows for the reason the fixture above is: a leaf left in",
+    "// its parent's job object dies when the parent does, which would let the",
+    "// stop appear to work without the tree ever being walked.",
+    `spawn(process.execPath, [${JSON.stringify(portServer)}, portFile], {`,
+    '  stdio: "ignore",',
+    '  detached: process.platform === "win32",',
+    "}).unref();",
+    "setTimeout(() => {}, 60000);",
+  ].join("\n"),
+  "utf-8"
+);
+
 function isAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+/** Whether anything is listening — asked from outside, as a client would. */
+function portOpen(port) {
+  return new Promise((resolve) => {
+    const socket = net.connect(port, "127.0.0.1");
+    const settle = (value) => { socket.destroy(); resolve(value); };
+    socket.on("connect", () => settle(true));
+    socket.on("error", () => settle(false));
+    setTimeout(() => settle(false), 1000);
+  });
 }
 
 async function poll(check, ms, intervalMs = 100) {
@@ -137,6 +191,24 @@ await run("a process that has already exited is not signalled again", async () =
 
   const stopped = await app.call("stop_process", { id: started.id });
   if (!stopped.already_exited) throw new Error("a dead pid was signalled, which the kernel may have reissued");
+});
+
+await run("stopping a job releases the port it was holding", async () => {
+  const portFile = path.join(tmp, "port.txt");
+  const started = await app.call("start_process", { command: `node "${portLauncher}" "${portFile}"` });
+  const port = await poll(
+    async () => Number(await fs.readFile(portFile, "utf-8").catch(() => "0")) || undefined,
+    20000
+  );
+  if (!port) throw new Error("the fixture never reported a port");
+  if (!(await poll(() => portOpen(port), 20000))) throw new Error(`nothing ever answered on port ${port}`);
+
+  // Unforced, because that is what a caller reaches for first and what used to
+  // report a stop while the port stayed taken.
+  await app.call("stop_process", { id: started.id, force: false });
+  if (!(await poll(async () => !(await portOpen(port)), 10000))) {
+    throw new Error(`port ${port} was still held after the stop reported success`);
+  }
 });
 
 await run("output still in the pipe when the process exits is not lost", async () => {
