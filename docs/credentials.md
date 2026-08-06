@@ -11,7 +11,7 @@ expose the host to ChatGPT through a tunnel.
 | `OPENAI_TUNNEL_ID` | Which tunnel to attach to | [Platform → Tunnels](https://platform.openai.com/settings/organization/tunnels) |
 | `OPENAI_TUNNEL_API_KEY` | Runtime key the tunnel daemon authenticates with | [Platform → API keys](https://platform.openai.com/settings/organization/api-keys), with **Tunnels Read + Use** |
 | `OPENAI_ADMIN_KEY` | Admin key for control-plane writes only | [Platform → Admin keys](https://platform.openai.com/settings/organization/admin-keys) |
-| `ADMIN_TOKEN` | Bearer token guarding this host's admin API | You choose it |
+| `ADMIN_TOKEN` | Bearer token guarding this host's admin API **and web UI** | Optional — you choose it, or the host generates one per run |
 
 All four are read from the environment first, then from `secrets.json`.
 
@@ -55,11 +55,20 @@ that follows fails for want of a tunnel:
 
 ```bash
 chatgpt-local-coder tunnel init
+read -rs OPENAI_ADMIN_KEY && export OPENAI_ADMIN_KEY
 ~/.cache/chatgpt-local-coder/tunnel-client/*/tunnel-client admin tunnels create \
   --name "Local Coder" \
   --description "Routes to my laptop" \
   --organization-id org_...
 ```
+
+The `export` is not optional here. `admin tunnels create` needs an admin key, and
+the binary takes it from `--admin-key` or, failing that, from `OPENAI_ADMIN_KEY`
+in the environment. Storing the key with `secrets set` is not enough for this
+route: the store deliberately does not export into your shell, and you are
+running the binary directly rather than through the host CLI that resolves it.
+Unset the variable afterwards — this is the one credential worth not leaving
+exported.
 
 `--name` and `--description` are both required, and at least one
 `--organization-id` or `--workspace-id` must be given. The `org_…` and `ws_…`
@@ -112,9 +121,11 @@ $b = New-Object byte[] 32
 [Convert]::ToBase64String($b)
 ```
 
-Any long random string works. With no token set, anything that can reach the
-admin port can drive the admin API — which matters when other people have
-accounts on the machine.
+Any long random string works, and you do not have to choose one. With
+`ADMIN_TOKEN` unset the host invents a random token at startup, so the admin API
+and UI are never open to an unauthenticated caller. Set it when you want a token
+that survives a restart, or when a script has to authenticate without reading the
+startup banner.
 
 ## Storing them
 
@@ -150,27 +161,40 @@ credential in turn and keeps existing entries unless you choose to replace them.
 
 ### 3. By hand
 
+Prefer `secrets set`. If you do write the file yourself, create it empty and
+restricted *first*, then open it in an editor — a key typed into a `cat` heredoc
+is recorded verbatim in `~/.bash_history`, and `cat >` creates the file with your
+umask, leaving it world-readable for the moment before `chmod` runs.
+
 ```bash
 mkdir -p ~/.config/chatgpt-local-coder
-cat > ~/.config/chatgpt-local-coder/secrets.json <<'EOF'
+touch ~/.config/chatgpt-local-coder/secrets.json
+chmod 600 ~/.config/chatgpt-local-coder/secrets.json
+"${EDITOR:-nano}" ~/.config/chatgpt-local-coder/secrets.json
+```
+
+```json
 {
   "OPENAI_TUNNEL_API_KEY": "sk-...",
   "OPENAI_TUNNEL_ID": "tunnel_..."
 }
-EOF
-chmod 600 ~/.config/chatgpt-local-coder/secrets.json
 ```
 
 A flat JSON object of string values. Unknown names are preserved but ignored.
-Do not forget the `chmod` — writing the file yourself skips the host's own
-`0600` creation.
+Writing the file yourself skips the host's own `0600` creation, which is why the
+`chmod` comes before the content rather than after it.
 
 ### 4. Environment variables
 
 ```bash
-export OPENAI_TUNNEL_API_KEY='sk-...'
+read -rs OPENAI_TUNNEL_API_KEY && export OPENAI_TUNNEL_API_KEY
 export OPENAI_TUNNEL_ID='tunnel_...'
 ```
+
+Typing a key directly into an `export` puts it in `~/.bash_history`; `read -rs`
+takes it from a hidden prompt instead. An exported value is also readable from
+`/proc/<pid>/environ` for every process you start from that shell, so prefer the
+secret store for anything long-lived and keep exports to one-offs and CI.
 
 **The environment always wins over the file.** That is convenient for a one-off
 or for CI, and it is also the most common way to lose an hour: a stale export in
@@ -190,9 +214,12 @@ source for exactly this reason.
 `$CLC_CONFIG_DIR` overrides all three. `chatgpt-local-coder secrets path` prints
 the resolved location.
 
-The file is created `0600` *before* any content is written, so a secret is never
-briefly world-readable. On Windows the DACL is restricted to your account with
-`icacls` instead.
+On Linux and macOS the file is created `0600` *before* any content is written, so
+a secret is never briefly world-readable. Windows is weaker: Node ignores the
+mode argument there, and `icacls` restricts the DACL only after the content has
+been written, so for that moment the file carries whatever ACL it inherited from
+`%APPDATA%`. On a machine where other accounts can read your `%APPDATA%`, store
+the credentials in the environment instead.
 
 ## Verifying
 
@@ -201,11 +228,22 @@ chatgpt-local-coder doctor
 ```
 
 ```
-  ok    OPENAI_TUNNEL_API_KEY=set, OPENAI_TUNNEL_ID=set, ADMIN_TOKEN=unset
+  ok    OPENAI_TUNNEL_API_KEY=set (env), OPENAI_TUNNEL_ID=set (file), ADMIN_TOKEN=unset, OPENAI_ADMIN_KEY=unset
 ```
 
-`doctor` prints `set` or `unset` and never a value. No secret appears in any
-log, tool output, or report.
+Each name that is set is annotated with where it came from, so a stale export
+shadowing the file is visible at a glance.
+
+`doctor` prints `set` or `unset` and never a value. No **stored** secret — a
+value in `secrets.json` or the environment — appears in any log, tool output, or
+report.
+
+One credential is not a stored secret and is treated differently: the admin token
+the host generates when `ADMIN_TOKEN` is unset. It has to reach you somehow, so
+it is printed as a ready-to-open URL — but only to an attached terminal. Started
+as a service, stdout goes to the system journal, so the banner prints the path to
+a `0600` file holding the URL instead. Set `ADMIN_TOKEN` yourself and nothing is
+printed at all.
 
 ## How credentials reach tunnel-client
 
@@ -216,9 +254,11 @@ file under `<config dir>/secret-refs/` and passes a **reference**:
 --runtime-api-key file:/home/you/.config/chatgpt-local-coder/secret-refs/OPENAI_TUNNEL_API_KEY
 ```
 
-`tunnel-client` accepts only `env:NAME` or `file:/path` for `--runtime-api-key`
-and `--admin-key`, and the host asserts that form before spawning. A literal in
-argv would be visible to every local user.
+`tunnel-client` itself requires the reference form for `--runtime-api-key`. For
+`--admin-key` it also accepts a raw value; refusing one is **this host's** rule,
+asserted before spawning, not something tunnel-client enforces. A literal in argv
+would be visible to every local user through `ps` and `/proc`, so driving
+`tunnel-client` directly gives up a guarantee the host CLI gives you.
 
 Once the credentials are stored, both commands resolve them on their own — no
 exports required:
@@ -233,11 +273,13 @@ key: `--admin-key env:MY_ADMIN_KEY`. A literal is rejected.
 
 ## `ADMIN_TOKEN` and the admin API
 
-`ADMIN_TOKEN` works from either source, but through a narrow path: the guard
-reads `process.env.ADMIN_TOKEN`, so the server hydrates the variable from the
-secret store at startup, before the admin server binds. An exported value still
-wins.
+`ADMIN_TOKEN` guards the admin API and the admin web UI alike — `/api` and `/ui`
+both answer `401` without it. Only `/health` is open, so `status` and `doctor`
+keep working.
 
+It works from either source, but through a narrow path: the guard reads
+`process.env.ADMIN_TOKEN`, so the server hydrates the variable from the secret
+store at startup, before the admin server binds. An exported value still wins.
 The practical consequence is that changing the stored token has no effect on a
 running server. Restart it.
 
@@ -250,8 +292,20 @@ Then, from another shell — the store deliberately does not put the value in yo
 environment, so a client has to be given it explicitly:
 
 ```bash
-curl -H "Authorization: Bearer <token>" http://127.0.0.1:3001/ui/
+curl -H "Authorization: Bearer <token>" http://127.0.0.1:3001/api/config/env
 ```
+
+The token is also accepted as `X-Admin-Token`, as `?token=` on a navigation, and
+as the `clc_admin` cookie the UI sets for itself.
+
+**When you set nothing.** The host generates a token for that run rather than
+leaving the routes open. Because a browser's address bar can carry only a URL,
+the banner prints a ready-to-open `http://127.0.0.1:3001/ui/?token=<token>`.
+Opening it exchanges the token for an httpOnly `SameSite=Strict` cookie and
+redirects to strip the token from the address bar; the cookie is issued only to a
+request that already presented the token, so asking for the page is never how you
+obtain one. A generated token dies with the process — set `ADMIN_TOKEN` to keep
+one across restarts.
 
 ## Rotating and removing
 
@@ -274,6 +328,7 @@ running daemon holds the old key.
 | `doctor` says `set` but the tunnel rejects the key | The key lacks Tunnels Read + Use, or it belongs to a different organization. |
 | A brand-new tunnel rejects the connection | It is not active yet. Wait 25–30 seconds after creating it. |
 | Authentication fails with a key you are sure is right | A trailing newline came along with the paste. `secrets set` trims; hand-editing does not. |
-| The admin API accepts unauthenticated calls after storing a token | The server was already running when you stored it. Restart. |
+| `Invalid admin token` for a token you just stored | The server was already running when you stored it, so it is still checking against the old one — or against a generated one, if there was no token at startup. Restart. |
+| `Admin token required. Open the admin UI using the URL printed at startup…` | Nothing was stored, so the host generated a token for this run. Open the URL from the banner — or from the file the banner names, if it started as a service. |
 | `Alias creation failed` during `tunnel init` | No admin key, or one without the admin-key permission. Store `OPENAI_ADMIN_KEY`, pass `--admin-key env:NAME`, or create the tunnel in the Tunnels web page and skip the step. |
 | The Tunnels page offers no **Create** button | Your role lacks Tunnels Manage. |

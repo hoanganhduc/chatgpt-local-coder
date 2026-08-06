@@ -1,6 +1,6 @@
 # Implementation Plan — Provider-Neutral Local Coding Host
 
-Status: approved for implementation
+Status: **implemented** — T1 through T15 have shipped
 Baseline commit: `81a53c9`
 Date locked: 2026-08-05
 
@@ -9,6 +9,14 @@ Windows-first ChatGPT MCP bridge into a cross-platform local coding host that
 runs the same skills and settings other agent CLIs use. It is decision-complete:
 an implementer should not need to choose architecture or infer expected
 behaviour.
+
+**Read it as a record of what was decided, not as a description of what runs.**
+The locked decisions in §1 still bind, and every task below shipped, but the
+implementation learned things the plan could not have known — a few interfaces
+gained arguments and a few behaviours were chosen differently once the code met
+a real OS. Where that happened it is marked **As shipped** inline. For the
+behaviour of the code as it stands, the authorities are `README.md`,
+`docs/cross-platform.md`, `docs/credentials.md`, and `AGENTS.md`.
 
 ---
 
@@ -64,10 +72,12 @@ Verified against the baseline commit:
 
 ```
 src/
+  admin/               # admin HTTP API, its token guard, and the web UI
   cli/                 # chatgpt-local-coder command surface
     main.ts            #   argv parse + dispatch
-    commands/          #   init, doctor, up, down, status, tunnel, service,
-                       #   skills, settings, config
+    commands/          #   init, secrets, serve, service, tunnel, misc
+                       #   (misc.ts carries doctor, up, down, status,
+                       #    skills, settings, config)
   config/
     schema.ts          # zod schema for host config
     load.ts            # layered resolution (defaults < file < env < flags)
@@ -93,6 +103,7 @@ src/
   hooks/
     engine.ts          # event dispatch
     matchers.ts        # tool-name/glob matching
+    wrap.ts            # the registerTool wrapper that fires them
   tunnel/
     release.ts         # releases/latest discovery + download + checksum
     runtime.ts         # runtimes create/connect/status/stop/rm wrappers
@@ -133,6 +144,12 @@ export function exeSuffix(): string;             // ".exe" on win32 else ""
 export async function killProcessTree(pid: number): Promise<void>;
 export function isWindows(): boolean;
 ```
+
+**As shipped:** `killProcessTree(pid, mode: KillMode = "escalate")`. The mode was
+added for `stop_process`, which needs to distinguish a polite `SIGTERM` from a
+`SIGKILL` — `escalate` (ask, then insist) belongs to the `runExecutable` timeout,
+which is not offering another chance. Windows treats all three alike; there is no
+signal a console process can decline.
 
 Shell selection order:
 
@@ -194,7 +211,9 @@ Schema (zod), with defaults:
 ```
 
 Path lists split on `path.delimiter` **and** `;`, so existing Windows-style
-`WORKSPACE_PATH=a;b` values keep working on all platforms.
+`WORKSPACE_PATH=a;b` values keep working on all platforms. On POSIX a part that
+looks like a Windows drive path (`C:\…` or `C:/…`) is exempted from the `:`
+split, which would otherwise shred it into `C` and a relative path.
 
 **Acceptance:** `scripts/test-config.mjs` proves each precedence layer overrides
 the one below it and that `;`-separated roots parse on Linux.
@@ -240,6 +259,13 @@ Behaviour per profile:
 | `open` | anywhere | anywhere | allowed |
 | `readonly` | anywhere | denied | denied |
 
+**As shipped:** "anywhere" carries one exception on every row. The host's own
+config directory — `~/.config/chatgpt-local-coder` and its `$CLC_CONFIG_DIR`
+equivalents, holding `secrets.json` — is denied to reads and writes under all
+three profiles, `open` included. A file tool that could read it would let a
+delegated agent lift the tunnel key, and no profile is meant to grant that.
+`chatgpt-local-coder secrets list` is the supported way to see what is stored.
+
 Boundary check: resolve the target with `fs.realpath` on the nearest existing
 ancestor, then require `resolved === root || resolved.startsWith(root + sep)`
 for some root. This defeats `..` traversal and symlink escape. Comparison is
@@ -281,9 +307,14 @@ Discovery roots, in precedence order (first match wins on duplicate `name`):
 2. Each `<workspaceRoot>/.claude/skills`
 3. `$AI_AGENTS_SKILLS_HOME` (if set)
 4. `~/.claude/skills`
-5. `~/.codex/skills`
-6. `~/ai-agents-skills/canonical/skills`
-7. Any extra `skills.roots` from config
+5. `~/.chatgpt-local-coder/skills`
+6. `~/.codex/skills`
+7. `~/ai-agents-skills/canonical/skills`
+8. Any extra `skills.roots` from config
+
+Root 5 is this host's own agent home — the directory the T13 `ai-agents-skills`
+target installs into. The plan first listed six roots and omitted it, which would
+have made T13 install skills into a directory T6 never read.
 
 Each skill is a directory containing `SKILL.md`. Frontmatter fields parsed:
 `name`, `description`, `allowed-tools`, `context`, `model`, `agent`, `hooks`,
@@ -297,11 +328,20 @@ instructions and bundled resources load only through `skill_read`.
 
 Execution (`skill_run`): resolves `entrypoint` relative to the skill directory,
 requires `runtime` in `{node, python, bash, powershell, none}`, and refuses to
-run when the current platform is not in `platforms` (default: all). The command
-runs through the platform shell with the configured timeout, inheriting the
-permission profile's command policy. A skill whose `runtime` is `bash` on native
-Windows produces the diagnostic `skill "<name>" requires bash; install Git Bash
-or run under WSL` rather than an obscure spawn error.
+run when the current platform is not in `platforms` (default: all). It runs with
+the configured timeout, inheriting the permission profile's command policy. A
+skill whose `runtime` is `bash` on native Windows produces the diagnostic
+`skill "<name>" requires bash; install Git Bash or run under WSL` rather than an
+obscure spawn error.
+
+**As shipped:** the interpreter is spawned **directly on the entrypoint file**,
+as an argv vector — not through the platform shell, and `CLC_SHELL` does not
+redirect it. Two reasons, and T1 already implied both. A skill declaring `bash`
+is not a script `sh` can run, so honouring the shell override would hand it the
+wrong language; and a shell string would let a skill directory containing a space
+or a quote turn into extra shell words. The entrypoint is also required to
+resolve inside the skill directory, so a `../../` entrypoint cannot make the
+skill file a way to execute an arbitrary path on the host.
 
 **Acceptance:** `scripts/test-skills.mjs` creates a temp tree with skills in two
 roots, asserts precedence, asserts frontmatter round-trip including unknown
@@ -370,6 +410,23 @@ version output. Invocation templates:
 | `codex` | `["exec", prompt]` |
 | `grok` | `["-p", prompt]` |
 | `opencode` | `["run", prompt]` |
+
+**As shipped:** the prompt is off argv wherever the CLI allows it, because on
+Windows a `.cmd` delegate is launched through cmd.exe, which re-parses the
+command line it is handed. Model-supplied text that never reaches that line is
+text cmd.exe cannot re-parse into a second command.
+
+| CLI | Argv | Prompt channel |
+|---|---|---|
+| `claude` | `["-p", "--output-format", "text"]` | stdin — `-p` with no operand reads it |
+| `codex` | `["exec", "-"]` | stdin — `-` means "read instructions from stdin" |
+| `grok` | `["--prompt-file", <path>]` | a `0600` temp file; only the path travels in argv |
+| `opencode` | `["run", prompt]` | argv — it offers neither other channel |
+
+`opencode` is the exception and pays for it: CR and LF cannot be encoded into a
+cmd.exe command line at all, so a **multi-line prompt to `opencode` is refused on
+Windows**, reported as a failed delegation naming the cause rather than silently
+truncated. See `docs/cross-platform.md` §3.
 
 `agent_delegate({ prompt, agent?, cwd?, timeout_sec? })` picks the first
 available CLI from `delegates.order`, runs it with `cwd` restricted by the
@@ -480,6 +537,7 @@ compatibility.
 | `up` | Foreground. Starts the MCP server, and unless `--no-tunnel`, connects the tunnel runtime. Ctrl-C stops both. |
 | `down` | Stops the tunnel runtime and any service-managed server. |
 | `status` | Server health, tunnel runtime status, session count. |
+| `secrets list\|set\|delete\|path` | T3 from the terminal. **Added during implementation:** T3 shipped a store with no way to fill it, and the alternative was telling people to hand-edit `secrets.json`, which loses the `0600`-before-content guarantee. `set` prompts with the input hidden and refuses a value passed as an argument, where `ps` and shell history would both catch it. |
 | `tunnel init\|connect\|status\|stop\|rm` | Thin wrappers over T10. |
 | `service install\|uninstall\|status` | T11. |
 | `skills list\|read\|run` | T6 from the terminal. |
@@ -546,7 +604,9 @@ hardcoded Windows path.
 
 ### T15 — Documentation
 
-**Files:** `README.md`, `AGENTS.md`, `docs/cross-platform.md` (new)
+**Files:** `README.md`, `AGENTS.md`, `docs/cross-platform.md` (new),
+`docs/credentials.md` (new — see T3/T10; obtaining and storing each credential
+turned out to need more than a README section)
 
 README must lead with the three-OS quickstart (`npm i -g`,
 `chatgpt-local-coder init`, `doctor`, `up`), state the workspace-scoped default
@@ -576,6 +636,22 @@ The work is done when all of the following hold:
 8. `agent_delegate` returns a bounded result from an installed CLI, or a
    structured error naming the CLIs it probed.
 9. No secret value appears in any log, tool output, or `doctor` report.
+
+**On gate 9, as shipped.** One value tested it: the admin token the host
+generates when `ADMIN_TOKEN` is unset. Generating one closed a real hole — the
+admin API used to wave every caller through whenever the variable was unset,
+which is its normal state, and `/api/config/env` returns and rewrites the `.env`
+file. But a token nobody can obtain is a token nobody can use, so it has to be
+shown somewhere.
+
+The gate is met by narrowing where "somewhere" is. The startup banner prints a
+ready-to-open `…/ui/?token=<token>` URL **only when stdout is a terminal** — the
+operator who ran the command and is looking at it. Off a terminal, which is every
+service install, stdout is a log, so the banner names the path to a `0600` file
+holding the URL instead and the token itself never reaches the log. Nothing
+changes for a configured `ADMIN_TOKEN`: it is never printed either way.
+`scripts/test-http-access.mjs` asserts the token is absent from the log and that
+the file is mode `0600`.
 
 ## 6. Evidence status
 

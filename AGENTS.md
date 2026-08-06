@@ -13,7 +13,7 @@ Windows, macOS và Linux.
 
 ## Tool profile — đọc trước khi gọi tool
 
-Profile mặc định là **`slim`**: chỉ **27 tool** được expose. Profile `full` có
+Profile mặc định là **`slim`**: **30 tool** được expose. Profile `full` có
 **53 tool**. Bảng bên dưới liệt kê cả 53; tool đánh dấu **†** **chỉ có ở
 `full`** — gọi nó dưới profile mặc định sẽ trả về `Tool not found`, đó không
 phải lỗi server.
@@ -37,7 +37,11 @@ Profile mặc định là **`workspace`**:
 - Ghi ra ngoài workspace roots sẽ bị **từ chối** — đây là hành vi đúng, không
   phải lỗi server. Nếu thật sự cần, báo user đổi profile hoặc thêm root; đừng
   tìm đường lách.
-- Đọc thì không giới hạn path ở cả ba profile.
+- Đọc không giới hạn path ở cả ba profile, **trừ thư mục config của chính host**
+  (`~/.config/chatgpt-local-coder`, hoặc `CLC_CONFIG_DIR` nếu được đặt). Thư mục
+  đó giữ `secrets.json`, nên bị chặn cả đọc lẫn ghi ở **mọi** profile — kể cả
+  `open`. Đây là hành vi đúng, không phải lỗi server. Muốn biết credential nào
+  đã đặt thì dùng `chatgpt-local-coder secrets list`.
 - `agent_status` cho biết root nào đang có hiệu lực (`permission_description`
   ghi rõ root được ghi). `list_allowed_directories`† chi tiết hơn nhưng chỉ có ở
   profile `full`.
@@ -128,7 +132,7 @@ mới. Dùng OpenAI Secure MCP Tunnel (`chatgpt-local-coder tunnel connect`) đ�
 | Chạy lệnh ngắn | `run_command` |
 | Build/test dài | `start_process` → `process_output` |
 | Git | `git_status`, `git_diff`, `git_commit`, `git_restore` |
-| Restore file từ commit | `git_restore` (không dùng `git_checkout` cho file) |
+| Restore file từ commit | `git_restore` (không dùng `git_checkout`† cho file) |
 | Undo edits trong session | `rewind`: `list` → `preview` → `restore` (không track bash) |
 | Switch branch | `git_checkout`† (chỉ branch) hoặc `git_branch`† action `switch` |
 | Chạy skill đã cài | `skill_list` → `skill_read` → `skill_run` |
@@ -136,10 +140,25 @@ mới. Dùng OpenAI Secure MCP Tunnel (`chatgpt-local-coder tunnel connect`) đ�
 
 † = chỉ có ở profile `full`. Dưới `slim`, làm cùng việc đó bằng `run_command`.
 
+### Kiểm tra thay đổi trong chính repo này
+
+Sửa code của host thì phải build lại rồi chạy test — test đọc từ `dist/`, nên
+bỏ bước build sẽ kiểm tra nhầm bản cũ:
+
+```bash
+npm run build
+node scripts/run-all-tests.mjs   # build + toàn bộ unit, server và integration test
+```
+
+Chạy nhanh một file: `node scripts/test-<tên>.mjs`. Các test tự spawn server
+trên port ngẫu nhiên, nên đừng chạy song song nhiều bản.
+
 ## Lệnh shell khác nhau theo hệ điều hành
 
 Host **không dịch** lệnh giữa các nền tảng. `run_command` chạy trên:
 
+- **`CLC_SHELL` nếu được đặt** — override này đứng trước tất cả, nên shell có thể
+  không khớp với hệ điều hành
 - **Windows:** `pwsh` nếu có, không thì `powershell.exe`
 - **macOS:** `$SHELL` nếu là `zsh`/`bash`/`sh`, không thì `/bin/zsh`
 - **Linux:** `$SHELL` nếu là `bash`/`zsh`/`sh`, không thì `/bin/sh`
@@ -222,7 +241,14 @@ line.
 > `tunnel connect` **khởi động runtime nền như một side effect**. Đừng gọi nó chỉ
 > để xem help — dùng `chatgpt-local-coder tunnel --help`.
 
-Health check: `http://127.0.0.1:3000/health` | Admin UI: `http://127.0.0.1:3001/ui`
+Health check: `http://127.0.0.1:3000/health` — không cần token.
+
+Admin UI cần token: vào thẳng `http://127.0.0.1:3001/ui` sẽ trả `401`, và `/api`
+cũng vậy. Mở URL kèm token mà server in ở banner khởi động (dòng `Admin UI:`),
+dạng `http://127.0.0.1:3001/ui/?token=<token>`. Nếu `ADMIN_TOKEN` chưa được đặt,
+host tự sinh token cho mỗi lần chạy; khi chạy dưới dạng service, banner in ra
+đường dẫn tới file chứa URL đó thay vì chính token. Đặt `ADMIN_TOKEN` để giữ
+nguyên token qua các lần khởi động lại.
 
 ## Troubleshooting
 

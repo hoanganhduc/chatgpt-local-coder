@@ -22,8 +22,25 @@ Everything that knows about an OS difference lives in `src/lib/platform.ts` and
 | Agent home | `%USERPROFILE%\.chatgpt-local-coder` | `~/.chatgpt-local-coder` | `~/.chatgpt-local-coder` |
 
 `CLC_CONFIG_DIR`, `CLC_STATE_DIR` and `CLC_CACHE_DIR` override the first three
-on every OS. Run `chatgpt-local-coder doctor` to print the resolved paths for
-the machine you are actually on.
+on every OS. Run `chatgpt-local-coder config path` to print the resolved paths
+for the machine you are actually on — `doctor` prints only the config **file**
+in its header, though `doctor --json` carries all five under `paths`.
+
+### Naming more than one workspace root
+
+`WORKSPACE_PATH` — and `EXTRA_WORKSPACE_PATHS`, `WORKSPACE_PATHS`,
+`ALLOWED_WORKSPACE_PATHS` — accept a list, and the separator is not the same
+everywhere:
+
+| OS | Separators | Example |
+|---|---|---|
+| Windows | `;` only | `C:\src\a;C:\src\b` |
+| macOS, Linux | `:` or `;` | `/src/a:/src/b` |
+
+`;` is honoured on all three so a value copied from a Windows machine keeps
+working, and on POSIX a part that looks like a drive path (`C:\…` or `C:/…`) is
+left alone rather than split at its colon. Quotes around a part are stripped and
+empty parts are dropped, so a trailing separator is harmless.
 
 The **agent home** is separate from the config dir on purpose. It is the
 directory `ai-agents-skills` installs into; the host reads it and never writes
@@ -61,6 +78,22 @@ Skills are the exception, and deliberately. A skill declares the `runtime` it
 needs — `node`, `python`, `bash`, `powershell` — and gets that interpreter;
 `CLC_SHELL` does not redirect it, because a skill written for `bash` is not a
 script `sh` can run.
+
+Only `node` is guaranteed: it is the interpreter already running the host. The
+rest are looked up on `PATH`, and what is normally there differs:
+
+| Runtime | Resolved as | Windows |
+|---|---|---|
+| `node` | this host's own `process.execPath` | always available |
+| `python` | `python3` then `python` on POSIX, `python` then `python3` on Windows | not shipped — install Python, and note the App Execution Alias stub that opens the Store is not an interpreter |
+| `bash` | `bash` | not shipped — Git Bash puts one on `PATH` |
+| `powershell` | `pwsh`, falling back to `powershell` on Windows only | always available |
+
+A missing interpreter is reported as a failed run naming what to install, not as
+an empty result. The asymmetry cuts both ways: a `powershell` skill needs
+PowerShell 7 (`pwsh`) installed on macOS and Linux, where nothing named
+`powershell` is accepted as a substitute. `chatgpt-local-coder doctor` probes
+`node`, `python3` and `git` and warns about each one it cannot find.
 
 The practical consequence for `run_command` on POSIX: it follows `$SHELL` like
 everything else here rather than always being `bash`. On a host whose `$SHELL`
@@ -169,17 +202,33 @@ create.
 ### Killing a timed-out child on Windows
 
 Windows has no process groups to signal, so `killProcessTree` walks the tree with
-`taskkill /T /F` where POSIX sends a signal to the negative pid. Both stock tools
-this host spawns — `cmd.exe` and `taskkill.exe` — are resolved to an absolute
-path under `%SystemRoot%\System32`, never launched by bare name: libuv resolves a
-Windows child from `PATH` alone and does not fall back to the System32 lookup
-`CreateProcess` performs on its own. Spawned by name under a narrowed `PATH` the
-kill fails with `ENOENT`, and because the failure was discarded the run reported
-`timedOut: true` while the child kept going — a delegate that outlives its
-timeout with nothing left to stop it. POSIX never showed this, `process.kill`
-being a syscall that consults no `PATH`. If `taskkill` fails anyway the host
-falls back to terminating the process itself, which does not reach its children
-but is not nothing.
+`taskkill /T /F` where POSIX sends a signal to the negative pid. `taskkill.exe`
+and `cmd.exe` are resolved to an absolute path under `%SystemRoot%\System32`
+(`systemTool` in `src/lib/platform.ts`) and never launched by bare name: libuv
+resolves a Windows child from `PATH` alone and does not fall back to the System32
+lookup `CreateProcess` performs on its own. Spawned by name under a narrowed
+`PATH` the kill fails with `ENOENT`, and because the failure was discarded the
+run reported `timedOut: true` while the child kept going — a delegate that
+outlives its timeout with nothing left to stop it. POSIX never showed this,
+`process.kill` being a syscall that consults no `PATH`. If `taskkill` fails
+anyway the host falls back to terminating the process itself, which does not
+reach its children but is not nothing.
+
+Those two are the tools spawned on a hot path, where a narrowed `PATH` is
+plausible and the failure would be silent. Three others are still spawned by
+bare name, and it is worth knowing which and why:
+
+| Tool | Spawned by | Consequence if `PATH` cannot find it |
+|---|---|---|
+| `icacls` | the secret store, to restrict the DACL | the file keeps the ACL it inherited from `%APPDATA%` — the one case here where a lost lookup weakens a guarantee rather than failing loudly |
+| `schtasks` | `service install`/`uninstall`/`stop` | the command reports a non-zero exit and the failing command line |
+| `powershell` | shell selection, only when `pwsh` is absent | `run_command` fails to start its shell |
+
+`schtasks` and `powershell` are run from an interactive command with the
+operator's own environment, and both fail visibly. `icacls` does not, so on a
+machine where other accounts can read your `%APPDATA%`, keep credentials in the
+environment rather than the store — the same advice `docs/credentials.md` gives
+for the write-then-restrict window.
 
 ### Killing a timed-out child on POSIX
 
@@ -290,15 +339,34 @@ the three implementations needs elevation, and none of them manages the tunnel �
 run `chatgpt-local-coder tunnel connect` separately, or use `up`, which does both
 in the foreground.
 
-| OS | Mechanism | Notes |
-|---|---|---|
-| Linux | systemd **user** unit | Needs a user session bus. Survives logout only when lingering is enabled (`loginctl enable-linger $USER`). |
-| macOS | LaunchAgent in `~/Library/LaunchAgents` | Starts at login. |
-| Windows | `schtasks` logon task | Starts at logon. No service-account install, so nothing runs before you log in. |
+| OS | Mechanism | Written to | Notes |
+|---|---|---|---|
+| Linux | systemd **user** unit `chatgpt-local-coder.service` | `~/.config/systemd/user/` | Needs a user session bus. Survives logout only when lingering is enabled (`loginctl enable-linger $USER`). |
+| macOS | LaunchAgent `com.chatgpt-local-coder` | `~/Library/LaunchAgents/com.chatgpt-local-coder.plist` | Starts at login. Installed with `launchctl bootstrap gui/<uid>`, which replaces the deprecated `load`; on macOS older than 10.11 use `launchctl load -w <plist>` by hand. |
+| Windows | `schtasks` logon task `ChatGPTLocalCoder` | `%LOCALAPPDATA%\chatgpt-local-coder\ChatGPTLocalCoder.xml` | Starts at logon. No service-account install, so nothing runs before you log in. |
 
-`service install --dry-run` prints the generated unit without installing it, and
-`--platform <win32\|darwin\|linux>` generates another platform's unit (implying
-`--dry-run`) so you can inspect all three from one machine.
+`service status` reports the mechanism and the path, so you never have to guess
+which of the three you are on.
+
+The Windows XML is written UTF-16LE with a BOM — `schtasks /Create /XML` rejects
+anything else — and it is the input to the task, not the task itself. Deleting
+it does not uninstall anything; `service uninstall` runs `schtasks /Delete`.
+
+### Previewing another platform's unit
+
+```bash
+chatgpt-local-coder service install --dry-run              # this machine, prints only
+chatgpt-local-coder service install --platform win32 --dry-run
+```
+
+`--dry-run` prints the generated unit and the commands that would install it,
+and writes nothing.
+
+**`--platform` alone is not a preview flag.** It implies `--dry-run` only when
+the platform you name differs from the one you are on, so
+`service install --platform linux` **on Linux really installs** — it writes the
+unit and runs `systemctl --user enable --now`. Pass `--dry-run` explicitly and
+the question does not arise.
 
 ---
 
@@ -306,14 +374,24 @@ in the foreground.
 
 Secrets are read from `process.env[NAME]` first and from
 `<config dir>/secrets.json` second, so an environment variable always wins over
-the stored file. The file is created with mode `0600`; on Windows the host
-additionally restricts the DACL with
-`icacls <file> /inheritance:r /grant:r <user>:F`.
+the stored file. On Linux and macOS the file is opened `0600` before any content
+is written. Windows cannot do that: Node ignores the mode argument there, so the
+host restricts the DACL afterwards with
+`icacls <file> /inheritance:r /grant:r <user>:F` and the file carries whatever it
+inherited from `%APPDATA%` until that returns.
 
-The host knows three names: `OPENAI_TUNNEL_API_KEY`, `OPENAI_TUNNEL_ID` and
-`ADMIN_TOKEN`. `doctor` reports each as `set` or `unset` with its source, and
-never prints a value. No secret value appears in any log, tool output or doctor
-report — that is a release gate, not a preference.
+The host knows four names: `OPENAI_TUNNEL_API_KEY`, `OPENAI_TUNNEL_ID`,
+`ADMIN_TOKEN` and `OPENAI_ADMIN_KEY`. `doctor` reports each as `set` or `unset`
+with its source, and never prints a value. No **stored** secret value appears in
+any log, tool output or doctor report — that is a release gate, not a
+preference.
+
+One value is not a stored secret and is handled separately: the admin token the
+host generates when `ADMIN_TOKEN` is unset. It has to reach the operator, so the
+startup banner prints a ready-to-open `…/ui/?token=<token>` URL — but only when
+stdout is a terminal. Under systemd, launchd or Task Scheduler stdout is a log,
+so the banner names the path to a `0600` file holding the URL instead, and the
+token itself is never written to the log on any of the three.
 
 When the tunnel manager passes credentials to `tunnel-client`, it passes only
 reference forms: `--runtime-api-key env:NAME` or `--runtime-api-key file:/path`.
@@ -341,6 +419,11 @@ skill `name` wins:
 6. `~/.codex/skills`
 7. `~/ai-agents-skills/canonical/skills`
 8. extra roots from `skills.roots` in the host config
+
+With more than one workspace root, steps 1 and 2 are two passes rather than one:
+every root's `.agents/skills` is consulted before any root's `.claude/skills`.
+Duplicate paths are collapsed, so naming the same directory twice changes
+nothing.
 
 `chatgpt-local-coder skills list --json` shows which root each skill came from
 and what was shadowed.
