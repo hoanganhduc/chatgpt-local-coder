@@ -76,6 +76,100 @@ function extractRequestId(body: unknown): string | number | null {
   return null;
 }
 
+/**
+ * Every method the protocol names, transcribed from the schemas the SDK
+ * declares in `types.js`.
+ *
+ * The set exists to separate two things this host used to answer identically:
+ * "no session, so I cannot serve you" and "nobody implements that". Only the
+ * first is a transport fault. OpenAI's connector announces itself to a new
+ * tunnel with `server/discover`, which is its own extension rather than a
+ * protocol method and arrives before any `initialize` — so it reached the
+ * sessionless branch and left as `400 Bad Request`. A client reading a 400 sees
+ * a broken server rather than one declining an optional method, and this one
+ * tried twice, five seconds apart, then stopped: the tools were never
+ * enumerated and the connector sat in every later chat with nothing in it.
+ *
+ * Membership is deliberately generous, covering the server-to-client requests
+ * that never arrive at this handler. The asymmetry is the reason: calling a
+ * real method unknown would answer `-32601` where a missing session was the
+ * whole problem, while calling an unknown method real just leaves the 400 that
+ * was already there.
+ */
+const MCP_METHODS = new Set([
+  "completion/complete",
+  "elicitation/create",
+  "initialize",
+  "logging/setLevel",
+  "notifications/cancelled",
+  "notifications/elicitation/complete",
+  "notifications/initialized",
+  "notifications/message",
+  "notifications/progress",
+  "notifications/prompts/list_changed",
+  "notifications/resources/list_changed",
+  "notifications/resources/updated",
+  "notifications/roots/list_changed",
+  "notifications/tasks/status",
+  "notifications/tools/list_changed",
+  "ping",
+  "prompts/get",
+  "prompts/list",
+  "resources/list",
+  "resources/read",
+  "resources/subscribe",
+  "resources/templates/list",
+  "resources/unsubscribe",
+  "roots/list",
+  "sampling/createMessage",
+  "tasks/cancel",
+  "tasks/get",
+  "tasks/list",
+  "tasks/result",
+  "tools/call",
+  "tools/list",
+]);
+
+/**
+ * Whether the body names a method the protocol defines.
+ *
+ * A batch — a JSON-RPC array — reports true whatever it holds, so that the
+ * paths below leave it exactly where it was; sorting a mixed batch into known
+ * and unknown halves is not something any client here sends.
+ */
+function isKnownMcpMethod(body: unknown): boolean {
+  if (typeof body !== "object" || body === null) return true;
+  if (Array.isArray(body)) return true;
+  const method = (body as { method?: unknown }).method;
+  if (typeof method !== "string") return true;
+  return MCP_METHODS.has(method);
+}
+
+/**
+ * Decline a method this server does not implement, as an answer rather than a
+ * refusal: HTTP 200 carrying `-32601`, which is what the SDK itself replies
+ * once a session exists. The two paths agreeing is the point — before this, the
+ * same request was a clean `Method not found` with a session and a
+ * `400 Bad Request` without one.
+ */
+function sendMethodNotFound(
+  res: Response,
+  method: string,
+  requestId: string | number | null = null
+): void {
+  const message = `Method not found: ${method}`;
+  // Recorded so the activity log names what was declined. It is logged at
+  // `ok`, because the status is 200 and declining an unimplemented method is a
+  // correct answer — but silence here is what let a failing connector probe go
+  // unnoticed for hours.
+  res.locals.mcpError = message;
+  res.status(200).json({
+    jsonrpc: "2.0",
+    error: { code: -32601, message },
+    id: requestId,
+  });
+}
+
 async function loopbackMcpPost(
   port: number,
   path: string,
@@ -461,4 +555,4 @@ export function isStaleSessionRequest(
   return Boolean(sessionId && !getSession(sessionId) && !isInitializeRequest(body));
 }
 
-export { extractRequestId, isInitializeRequest };
+export { extractRequestId, isInitializeRequest, isKnownMcpMethod, sendMethodNotFound, MCP_METHODS };

@@ -94,6 +94,59 @@ await run("tools/list with valid session", async () => {
   }
 });
 
+// OpenAI's connector announces itself to a new tunnel with `server/discover`,
+// its own extension rather than a protocol method, and sends it before any
+// `initialize`. That used to land on the sessionless branch and come back as
+// `400 Bad Request`, which reads as a broken server rather than as a declined
+// extension: the live connector tried twice, five seconds apart, then stopped,
+// and every later chat showed Local Coder with no tools in it.
+await run("unknown method without a session is declined, not refused", async () => {
+  const { status, json } = await mcpPost(
+    "/mcp",
+    { jsonrpc: "2.0", id: "openai-mcp-discover", method: "server/discover" },
+    null
+  );
+  if (status !== 200) throw new Error(`expected HTTP 200, got ${status}: ${JSON.stringify(json)}`);
+  if (json?.error?.code !== -32601) {
+    throw new Error(`expected -32601, got ${JSON.stringify(json)}`);
+  }
+  if (json?.id !== "openai-mcp-discover") {
+    throw new Error(`request id not echoed: ${JSON.stringify(json)}`);
+  }
+});
+
+// The two paths agreeing is the whole point of the fix: the SDK has always
+// answered this way once a session exists, and the sessionless answer differing
+// from it is what made an absent method look like a fault.
+await run("unknown method answers the same with a session", async () => {
+  const { status, json } = await mcpPost(
+    "/mcp",
+    { jsonrpc: "2.0", id: 20, method: "server/discover" },
+    sessionId,
+    { "mcp-protocol-version": "2025-03-26" }
+  );
+  if (status !== 200) throw new Error(`expected HTTP 200, got ${status}: ${JSON.stringify(json)}`);
+  if (json?.error?.code !== -32601) {
+    throw new Error(`expected -32601, got ${JSON.stringify(json)}`);
+  }
+});
+
+// The guard against fixing this too broadly. `tools/list` is a method this
+// server does implement, so a sessionless one is genuinely missing its session
+// and must keep saying so — answering `-32601` there would report the method as
+// absent when a session was the only thing lacking.
+await run("known method without a session still reports the missing session", async () => {
+  const { status, json } = await mcpPost(
+    "/mcp",
+    { jsonrpc: "2.0", id: 21, method: "tools/list", params: {} },
+    null
+  );
+  if (status !== 400) throw new Error(`expected HTTP 400, got ${status}: ${JSON.stringify(json)}`);
+  if (!/Mcp-Session-Id/i.test(json?.error?.message ?? "")) {
+    throw new Error(`expected a session-id message, got ${JSON.stringify(json)}`);
+  }
+});
+
 await run("stale session auto-recovery", async () => {
   const fakeId = "00000000-0000-4000-8000-000000000099";
   const { status, json } = await mcpPost(

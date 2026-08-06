@@ -20,6 +20,8 @@ import {
   createSessionManager,
   extractRequestId,
   isInitializeRequest,
+  isKnownMcpMethod,
+  sendMethodNotFound,
 } from "./lib/mcp-session-manager.js";
 import { initUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { announceAdminUrl, startAdminServer } from "./admin/server.js";
@@ -299,6 +301,15 @@ async function handleMcpPost(req: express.Request, res: express.Response): Promi
         console.log(`[MCP] Re-initialize with stale session header: ${sessionId}`);
       }
       await sessionManager.createNew(req, res, req.body);
+      return;
+    }
+
+    // Answered before the session is considered, because a method nobody
+    // implements is not a session problem. With a session the SDK already
+    // replies `-32601` to exactly this, so the sessionless path now agrees with
+    // it instead of returning a 400 that reads as a broken server.
+    if (!isKnownMcpMethod(req.body)) {
+      sendMethodNotFound(res, String((req.body as { method?: unknown })?.method), requestId);
       return;
     }
 
