@@ -203,18 +203,6 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
     }
   });
 
-  async function handleImport(
-    source: McpImportSource,
-    body: { path?: string; merge?: boolean; enable?: boolean }
-  ) {
-    const configPath = body.path || (await findMcpConfigForSource(source));
-    if (!configPath) throw new Error(`${source} MCP config not found on this machine`);
-    return importMcpConfigFromFile(configPath, source, {
-      merge: body.merge !== false,
-      enableImported: Boolean(body.enable),
-    });
-  }
-
   router.post("/api/import/:source", async (req, res) => {
     try {
       const source = req.params.source as McpImportSource;
@@ -227,22 +215,23 @@ export function createAdminRouter(manager: McpUpstreamManager, options: {
         res.status(400).json({ ok: false, error: "path required for file import" });
         return;
       }
+      // Said plainly, because the alternative is worse than it looks:
+      // `findMcpConfigForSource` returns null when the source is not installed
+      // here, and the non-null assertion this line replaces handed that null
+      // straight to the importer, which failed somewhere inside a file read
+      // with a message naming no source at all. A caller reading that cannot
+      // tell "Cursor is not on this machine" from "the file is malformed".
+      const discovered = filePath || (await findMcpConfigForSource(source));
+      if (!discovered) {
+        res.status(400).json({ ok: false, error: `${source} MCP config not found on this machine` });
+        return;
+      }
       const detectSource: McpImportSource =
         source === "file" ? (req.body?.detect_as as McpImportSource) || "cursor" : source;
-      const result = await importMcpConfigFromFile(filePath || (await findMcpConfigForSource(source))!, detectSource, {
+      const result = await importMcpConfigFromFile(discovered, detectSource, {
         merge: req.body?.merge !== false,
         enableImported: Boolean(req.body?.enable),
       });
-      await manager.reloadConfig();
-      res.json({ ok: true, ...result });
-    } catch (err) {
-      res.status(400).json({ ok: false, error: err instanceof Error ? err.message : String(err) });
-    }
-  });
-
-  router.post("/api/import/cursor", async (req, res) => {
-    try {
-      const result = await handleImport("cursor", req.body ?? {});
       await manager.reloadConfig();
       res.json({ ok: true, ...result });
     } catch (err) {

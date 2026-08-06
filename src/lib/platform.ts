@@ -294,9 +294,9 @@ export interface RunResult {
    */
   spawnFailed?: boolean;
   /**
-   * Set when output passed `maxOutputBytes` and the rest was dropped. A reader
-   * that cannot tell a complete result from a clipped one draws conclusions
-   * from output it does not have.
+   * Set when output passed the `maxOutputBytes` cap and the rest was dropped. A
+   * reader that cannot tell a complete result from a clipped one draws
+   * conclusions from output it does not have.
    */
   truncated?: boolean;
 }
@@ -465,6 +465,20 @@ export function runExecutable(
     cwd?: string;
     timeoutMs?: number;
     env?: NodeJS.ProcessEnv;
+    /**
+     * How much of each stream to keep, counted in UTF-16 code units — the unit
+     * JavaScript's own `.length` reports — and not in bytes, whatever the name
+     * says. The two agree on ASCII and part company everywhere else: a cap of
+     * 1000 keeps 1000 CJK characters, which is 3000 bytes of UTF-8. Budget for
+     * three times the number here when the output may be non-ASCII.
+     *
+     * The name is left as it is because it is the exported signature and
+     * `git-run.ts` republishes it: renaming it would turn every call that still
+     * passes the old key into a silently uncapped one, which is a worse failure
+     * than a name that has to be read alongside this note. Code units are also
+     * the quantity actually worth bounding, since what the cap protects against
+     * is V8 refusing a string past its maximum length.
+     */
     maxOutputBytes?: number;
     /** Written to the child's stdin, which is then closed. */
     stdin?: string;
@@ -540,7 +554,7 @@ export function runExecutable(
     const bounded = (key: "stdout" | "stderr"): string => {
       const text = captured[key].trim();
       if (!dropped[key]) return text;
-      return `${text}\n[output truncated at ${maxOutput} bytes]`;
+      return `${text}\n[output truncated at ${maxOutput} characters]`;
     };
 
     const finish = (exitCode: number | null, spawnFailed = false) => {
@@ -567,9 +581,10 @@ export function runExecutable(
     }
 
     /**
-     * Keep up to `maxOutput` and drop the rest, without ever stopping reading:
-     * a stream left unread fills its pipe and blocks the writer, so a command
-     * that printed too much would hang rather than be truncated.
+     * Keep up to `maxOutput` code units and drop the rest, without ever
+     * stopping reading: a stream left unread fills its pipe and blocks the
+     * writer, so a command that printed too much would hang rather than be
+     * truncated.
      *
      * The cap is applied inside a chunk and not only between chunks. A chunk is
      * however much the OS had ready, not a fixed size: Linux hands over 64KB at

@@ -159,6 +159,44 @@ await checkAsync("the highest-precedence root wins a duplicate name", async () =
   assert(shadowed.filter((s) => s.name === "shared").length === 2, `shadowed: ${shadowed.length}`);
 });
 
+// Discovery keyed the exact name while `findSkill` compared lowercased, so
+// `Zotero` and `zotero` both survived as separate entries and `skill_list`
+// advertised both — but every lookup of either name reached whichever sorted
+// first, leaving the other listed and unreachable. The collision belongs in
+// `shadowed`, where a user can see which copy lost.
+await checkAsync("two skills differing only in case collapse to one, and the loser is reported", async () => {
+  // Its own tree: the shared fixtures above assert an exact name list, and a
+  // case variant added there would change it.
+  const caseTmp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-skills-case-"));
+  const caseWs = path.join(caseTmp, "workspace");
+  const caseHome = path.join(caseTmp, "home");
+  await writeSkill(path.join(caseWs, ".agents", "skills"), "Zotero", "name: Zotero\ndescription: capitalised, workspace");
+  await writeSkill(path.join(caseHome, ".claude", "skills"), "zotero", "name: zotero\ndescription: lowercase, home");
+
+  const opts = { workspaceRoots: [caseWs], homeDir: caseHome, env: emptyEnv };
+  const { skills, shadowed } = await discoverSkills(opts);
+
+  const matches = skills.filter((s) => s.name.toLowerCase() === "zotero");
+  assert(matches.length === 1, `expected one entry, got ${matches.map((s) => s.name).join(",")}`);
+  // Folded for the key, kept as written for display: a skill named `Zotero`
+  // must not be listed as `zotero`.
+  assert(matches[0].name === "Zotero", `display name: ${matches[0].name}`);
+  assert(matches[0].root.origin === "workspace-agents", `origin: ${matches[0].root.origin}`);
+  assert(
+    shadowed.some((s) => s.name === "zotero" && s.shadowedBy === matches[0].file),
+    `shadowed: ${JSON.stringify(shadowed)}`
+  );
+
+  resetSkillRegistry();
+  await loadSkillRegistry(opts);
+  for (const spelling of ["Zotero", "zotero", "ZOTERO"]) {
+    assert(findSkill(spelling)?.file === matches[0].file, `findSkill(${spelling}) missed the surviving copy`);
+  }
+
+  resetSkillRegistry();
+  await fs.rm(caseTmp, { recursive: true, force: true });
+});
+
 await checkAsync("skills from every root are merged, including nested directories", async () => {
   const { skills } = await discoverSkills(discoverOpts);
   const names = skills.map((s) => s.name).sort();

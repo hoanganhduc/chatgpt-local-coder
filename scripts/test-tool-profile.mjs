@@ -8,13 +8,34 @@ const ALL_KNOWN = [
   "git_status", "mcp_call", "delete_directory", "read_file_base64",
 ];
 
+/**
+ * The size the docs promise. Four places state it — README.md's tool-count
+ * line, the sentence introducing the tool tables, the `toolProfile` settings
+ * row, and AGENTS.md's opening paragraph — and a reader who counts the tables
+ * against the number is entitled to find them equal.
+ *
+ * Pinned exactly rather than bounded. The assertion this replaces read
+ * `size < 18` against a set of 30: a floor wearing a ceiling's clothes, which
+ * passed however far the set grew and so enforced nothing about the payload
+ * size the slim profile exists to keep down. Bounding it from above alone would
+ * have let the count drift below the documented figure instead. Growing or
+ * shrinking the set is fine — update this number and the four doc sites in the
+ * same change, which is the whole point of pinning it.
+ */
+const SLIM_TOOL_COUNT = 30;
+
 let passed = 0;
 let failed = 0;
 function ok(m) { console.log(`OK  ${m}`); passed++; }
 function fail(m, e) { console.error(`FAIL ${m}: ${e}`); failed++; }
 
 try {
-  if (SLIM_CHATGPT_TOOLS.size < 18) throw new Error(`slim set too small: ${SLIM_CHATGPT_TOOLS.size}`);
+  if (SLIM_CHATGPT_TOOLS.size !== SLIM_TOOL_COUNT) {
+    throw new Error(
+      `slim profile has ${SLIM_CHATGPT_TOOLS.size} tools, expected ${SLIM_TOOL_COUNT}; ` +
+        "update SLIM_TOOL_COUNT here and the four counts in README.md and AGENTS.md together"
+    );
+  }
   ok(`slim profile has ${SLIM_CHATGPT_TOOLS.size} tools`);
 
   for (const t of ["apply_patch", "glob", "remember", "load_path_rules"]) {

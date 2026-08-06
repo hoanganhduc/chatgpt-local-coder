@@ -6,6 +6,10 @@
  * one of the same name, which is what every other agent host in this family
  * does, and it means a user can shadow a canonical skill without editing the
  * canonical repo.
+ *
+ * Names are compared without regard to case, matching how `findSkill` resolves
+ * one: `Zotero` and `zotero` are the same skill, so one shadows the other
+ * rather than both being listed.
  */
 
 import fs from "fs/promises";
@@ -173,12 +177,19 @@ export async function discoverSkills(opts: DiscoverOptions): Promise<DiscoveryRe
     skills.sort((a, b) => a.file.localeCompare(b.file));
 
     for (const skill of skills) {
-      const existing = byName.get(skill.name);
+      // Keyed folded, displayed as written. `findSkill` has always compared
+      // lowercased, so `zotero` and `Zotero` were one skill at lookup time and
+      // two here: both survived discovery, `skill_list` advertised both, and
+      // whichever sorted first answered for both names while the other could
+      // not be reached at all. Folding the key moves that collision to where it
+      // is visible — the loser is now reported in `shadowed` like any other.
+      const key = skill.name.toLowerCase();
+      const existing = byName.get(key);
       if (existing) {
         shadowed.push({ name: skill.name, file: skill.file, shadowedBy: existing.file });
         continue;
       }
-      byName.set(skill.name, skill);
+      byName.set(key, skill);
     }
   }
 

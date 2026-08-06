@@ -509,7 +509,7 @@ network except `npm ci`.
 | **`stream canceled` in the tunnel log** | Server or tunnel restarted mid-session. Refresh the connector, new chat. |
 | **Tunnel URL keeps changing** | Use the OpenAI Secure Tunnel (`tunnel init` / `tunnel connect`) instead of a Cloudflare quick tunnel. |
 | **A command works on one OS, not another** | Shells differ per platform and the host does not translate. See [docs/cross-platform.md](docs/cross-platform.md#2-shell-selection). |
-| **`run_command` output ends in `[output truncated at 2000000 bytes]`** | A command may print at most 2,000,000 bytes; the rest is dropped and the result is flagged `truncated`. Redirect to a file and read it in pieces. |
+| **`run_command` output ends in `[output truncated at 2000000 characters]`** | A command may print at most 2,000,000 characters per stream — up to about 6 MB once non-ASCII text is encoded — and the rest is dropped, with the result flagged `truncated`. Redirect to a file and read it in pieces. |
 | **`run_command` returns while the job keeps running** | Expected: a command that exits while leaving something running (`npm run dev &`) is answered when *it* exits. Use `start_process` for a job you want to manage. |
 | **A `git_*` tool reports a timeout** | A git subcommand gets 2 minutes, and the session-start snapshot 15 seconds. A `pre-commit` hook that runs a test suite is the usual cause — run that through `run_command`, which reports progress and has its own cap. |
 | **git not found** | Install [Git](https://git-scm.com). Everything except the `git_*` tools works without it. |
