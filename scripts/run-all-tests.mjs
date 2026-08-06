@@ -73,6 +73,7 @@ const unitScripts = [
   "scripts/test-tool-profile.mjs",
   "scripts/test-instructions.mjs",
   "scripts/test-shell-persist.mjs",
+  "scripts/test-background-process.mjs",
   "scripts/test-git-run.mjs",
 ];
 

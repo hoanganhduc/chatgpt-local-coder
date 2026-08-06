@@ -249,6 +249,38 @@ deliberately refused — so it blocked the tool call. `runHooks` now consults
 Windows shape on POSIX with a `TERM` trap, so it fails on every OS rather than
 only the one where it bites.
 
+### Stopping a background job
+
+`stop_process` had the same defect from the other direction, and for longer.
+What `start_process` spawns is a shell, and the job the caller cares about is
+that shell's child or its grandchild: `npm run dev` is a package manager that
+starts a server. Stopping it signalled the one process this host had spawned, so
+the shell died, the server kept the port, and the tool reported a stop that had
+reached nothing anyone was asking about. Background shells are now spawned
+detached on POSIX, like every other child here, and stopped through
+`killProcessTree`.
+
+The two stop modes map onto POSIX signals directly: `force` sends `SIGKILL` to
+the group, and an ordinary stop sends `SIGTERM` once and leaves it there — a
+caller that asked politely and got no answer can decide for itself whether to
+insist. The `escalate` mode that asks and then insists belongs to the timeout in
+`runExecutable`, which is not offering another chance. Windows treats all three
+alike. There is no signal a console process can decline, `child.kill("SIGTERM")`
+there was already a `TerminateProcess`, and `taskkill` without `/F` only asks
+windows to close — a console child would refuse it and the caller would be told
+a stop was sent that never landed.
+
+A background process is also recorded as finished on `exit` rather than `close`,
+for the reason the section above gives: a job that leaves a descendant holding
+the stdio pipes would otherwise be reported as running long after it was gone.
+That is not merely a stale display. The kernel may reuse a pid the moment it is
+free, and `stop_process` declines to signal a process it has already seen exit —
+so a record that never flips is a record that could send `SIGKILL` to a group
+belonging to a stranger. Nothing is given up by reporting the finish earlier:
+what the process printed has been read to the end before `exit` is delivered, and
+the case where the two events genuinely separate is precisely the one where no
+later moment ever arrives.
+
 ---
 
 ## 4. Background service

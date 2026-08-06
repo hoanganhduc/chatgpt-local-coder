@@ -4,7 +4,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
 import { requireCommandAllowed } from "../lib/permissions.js";
 import { audit } from "../lib/audit.js";
-import { defaultShell } from "../lib/platform.js";
+import { defaultShell, detachedSpawnOptions, killProcessTree, trackChild } from "../lib/platform.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 import {
@@ -116,7 +116,19 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       requireCommandAllowed(command);
       const cwd = working_directory ? await validatePath(working_directory, "read") : getShellStatus().cwd || defaultCwd;
       const shell = defaultShell();
-      const child = spawn(shell.command, shell.args(command), { cwd, windowsHide: true, env: process.env });
+      const child = spawn(shell.command, shell.args(command), {
+        cwd,
+        env: process.env,
+        // Detached, so this shell leads a process group and `stop_process` can
+        // reach the job it started rather than only the shell that leads it.
+        // No-op on Windows, where the tree is walked by taskkill instead.
+        ...detachedSpawnOptions(),
+      });
+      // Detaching is also what takes the shell out of the terminal's foreground
+      // group, where a Ctrl+C used to reach it. Tracking it is the other half of
+      // that trade: without it, interrupting the host would leave a background
+      // job running and reparented to init.
+      const untrack = trackChild(child.pid);
       const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
       const item: ManagedProcess = {
         id,
@@ -132,9 +144,22 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       processes.set(id, item);
       child.stdout.on("data", (d: Buffer) => appendLog(item.stdout, d));
       child.stderr.on("data", (d: Buffer) => appendLog(item.stderr, d));
-      child.on("close", (code, signal) => {
+      // Recorded on `exit` rather than `close`. `close` waits for the stdio
+      // pipes as well, and a job that leaves something holding them would keep
+      // this reporting `running` long after the process itself was gone — which
+      // is not merely inaccurate here: the kernel is free to reuse a pid the
+      // moment it exits, so a stop that signalled a process group on the
+      // strength of a stale record would be signalling a stranger.
+      //
+      // Nothing is given up by reporting the finish this early. What the
+      // process printed has been read to the end by the time `exit` arrives,
+      // and the case where the two events do come apart is the one above — a
+      // grandchild still holding the pipes, still printing, where there is no
+      // later moment to wait for.
+      child.on("exit", (code, signal) => {
         item.exitCode = code;
         item.signal = signal;
+        untrack();
       });
       await audit({ tool: "start_process", action: "start", target: cwd, status: "ok", details: { id, command } });
       return toolResult("start_process", { id, pid: child.pid, command, cwd, started_at: item.startedAt }, {
@@ -211,9 +236,14 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       if (item.exitCode !== null || item.signal !== null) {
         return toolResult("stop_process", { id, already_exited: true }, { summary: `${id} already exited` });
       }
-      item.child.kill(force ? "SIGKILL" : "SIGTERM");
+      // The whole group, not just the shell. `npm run dev` is the shell's child
+      // and the server is that child's child, so signalling the one process
+      // this host started left the job running and the port held while the tool
+      // reported a stop. Safe against a recycled pid because a process already
+      // seen to exit returned above.
+      await killProcessTree(item.child.pid ?? 0, force ? "force" : "graceful");
       await audit({ tool: "stop_process", action: "stop", target: item.cwd, status: "ok", details: { id, force } });
-      return toolResult("stop_process", { id, force }, { summary: `stop sent to ${id}` });
+      return toolResult("stop_process", { id, force }, { summary: `stop sent to ${id} and everything it started` });
     }
   );
 

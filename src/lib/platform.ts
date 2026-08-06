@@ -205,8 +205,27 @@ export function trackChild(pid: number | undefined): () => void {
   return () => liveChildren.delete(pid);
 }
 
-/** Kill a process and everything it started. Never throws. */
-export async function killProcessTree(pid: number): Promise<void> {
+/**
+ * How hard to insist.
+ *
+ *   escalate — ask, then insist. What a timeout wants: the process has had its
+ *              chance and the caller is not offering another one.
+ *   graceful — ask once and stop there, for a caller that means "please stop"
+ *              and will follow up itself if the answer is no.
+ *   force    — no asking.
+ */
+export type KillMode = "escalate" | "graceful" | "force";
+
+/**
+ * Kill a process and everything it started. Never throws.
+ *
+ * Windows treats all three modes alike, and little is lost by it: there is no
+ * signal a console process can decline, and `child.kill("SIGTERM")` there was
+ * already a TerminateProcess. `taskkill` without `/F` only asks windows to
+ * close, so a console child would refuse it and the caller would be told a stop
+ * was sent that never landed.
+ */
+export async function killProcessTree(pid: number, mode: KillMode = "escalate"): Promise<void> {
   if (!pid || pid <= 0) return;
 
   if (isWindows()) {
@@ -233,28 +252,32 @@ export async function killProcessTree(pid: number): Promise<void> {
     return;
   }
 
-  try {
-    // Negative pid targets the process group created by detached spawn.
-    process.kill(-pid, "SIGTERM");
-  } catch {
+  // Negative pid targets the process group created by detached spawn. The
+  // process alone is the fallback: a child spawned without `detached` never led
+  // a group, and reaching only it is better than reaching nothing.
+  const signal = (name: NodeJS.Signals): boolean => {
     try {
-      process.kill(pid, "SIGTERM");
+      process.kill(-pid, name);
+      return true;
     } catch {
-      return;
+      try {
+        process.kill(pid, name);
+        return true;
+      } catch {
+        return false;
+      }
     }
+  };
+
+  if (mode === "force") {
+    signal("SIGKILL");
+    return;
   }
+
+  if (!signal("SIGTERM") || mode === "graceful") return;
 
   await new Promise((resolve) => setTimeout(resolve, 500));
-
-  try {
-    process.kill(-pid, "SIGKILL");
-  } catch {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {
-      /* already gone */
-    }
-  }
+  signal("SIGKILL");
 }
 
 export interface RunResult {
