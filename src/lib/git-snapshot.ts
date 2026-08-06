@@ -1,25 +1,14 @@
-import { spawn } from "child_process";
 import os from "os";
+import { runGit } from "./git-run.js";
 
-interface GitRunResult {
-  stdout: string;
-  stderr: string;
-  exit_code: number;
-}
+/**
+ * How long the snapshot waits on git. Far shorter than a git tool call is
+ * allowed: this runs while a session is starting, and context that says nothing
+ * is better than context that arrives two minutes late.
+ */
+const SNAPSHOT_TIMEOUT_MS = 15_000;
 
-function runGit(args: string[], cwd: string): Promise<GitRunResult> {
-  return new Promise((resolve) => {
-    const child = spawn("git", args, { cwd, windowsHide: true });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    child.on("close", (code) => {
-      resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code ?? 1 });
-    });
-    child.on("error", () => resolve({ stdout: "", stderr: "git not found", exit_code: 127 }));
-  });
-}
+const snapshotGit = (args: string[], cwd: string) => runGit(args, cwd, { timeoutMs: SNAPSHOT_TIMEOUT_MS });
 
 export interface GitSnapshot {
   is_repo: boolean;
@@ -30,15 +19,15 @@ export interface GitSnapshot {
 }
 
 export async function collectGitSnapshot(cwd: string): Promise<GitSnapshot> {
-  const root = await runGit(["rev-parse", "--show-toplevel"], cwd);
+  const root = await snapshotGit(["rev-parse", "--show-toplevel"], cwd);
   if (root.exit_code !== 0) {
-    return { is_repo: false, error: root.stderr || "not a git repository" };
+    return { is_repo: false, error: root.not_found ? "git not found" : root.stderr || "not a git repository" };
   }
 
   const [branch, status, log] = await Promise.all([
-    runGit(["branch", "--show-current"], cwd),
-    runGit(["status", "--short", "--branch"], cwd),
-    runGit(["log", "-3", "--oneline", "--no-decorate"], cwd),
+    snapshotGit(["branch", "--show-current"], cwd),
+    snapshotGit(["status", "--short", "--branch"], cwd),
+    snapshotGit(["log", "-3", "--oneline", "--no-decorate"], cwd),
   ]);
 
   return {

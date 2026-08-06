@@ -1,34 +1,17 @@
-import { spawn } from "child_process";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
 import { audit } from "../lib/audit.js";
+import { runGit, type GitRunResult } from "../lib/git-run.js";
 import { requireWriteAllowed, type PathIntent } from "../lib/permissions.js";
 import { toolAnnotations } from "../lib/tool-annotations.js";
 import { toolResult } from "../lib/tool-result.js";
 
-interface GitRunResult {
-  stdout: string;
-  stderr: string;
-  exit_code: number;
-}
-
-function runGit(args: string[], cwd: string): Promise<GitRunResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("git", args, { cwd, windowsHide: true });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d: Buffer) => (stdout += d.toString()));
-    child.stderr.on("data", (d: Buffer) => (stderr += d.toString()));
-    child.on("close", (code) => {
-      resolve({ stdout: stdout.trim(), stderr: stderr.trim(), exit_code: code ?? 1 });
-    });
-    child.on("error", () => reject(new Error("git not found. Install Git for Windows.")));
-  });
-}
-
 async function gitOrThrow(args: string[], cwd: string): Promise<GitRunResult> {
   const result = await runGit(args, cwd);
+  // Reported as its own failure rather than as a git that ran and disagreed:
+  // there is nothing about the repository to fix.
+  if (result.not_found) throw new Error("git not found. Install Git for Windows.");
   if (result.exit_code !== 0) {
     throw new Error(result.stderr || result.stdout || `git exited with code ${result.exit_code}`);
   }
