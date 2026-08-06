@@ -29,6 +29,15 @@ export interface McpSession {
   server: McpServer;
   lastAccessedAt: number;
   createdAt: number;
+  /**
+   * The client sent DELETE and the transport is closed, but the session entry is
+   * held a little longer. A tool call that was already running finishes because
+   * DELETE waits behind it in the session queue; this window covers what comes
+   * after — a late retry or a duplicate POST on the same session must be turned
+   * away rather than handed to a closed transport, which accepts the request and
+   * never answers it.
+   */
+  closedByClient?: boolean;
 }
 
 export interface SessionManagerConfig {
@@ -101,6 +110,17 @@ export function consumeSessionTransportError(sessionId?: string): string | undef
   return message;
 }
 
+function sendSessionNotFound(res: Response, requestId: string | number | null = null): void {
+  const message =
+    "Session not found. Server restarted or connector session expired — refresh connector and open a new chat.";
+  res.locals.mcpError = message;
+  res.status(404).json({
+    jsonrpc: "2.0",
+    error: { code: -32001, message },
+    id: requestId,
+  });
+}
+
 async function enqueueSessionOp(sessionId: string, op: () => Promise<void>): Promise<void> {
   const prev = sessionOpChains.get(sessionId) ?? Promise.resolve();
   const run = prev.catch(() => undefined).then(op);
@@ -138,7 +158,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
   function scheduleDeleteGrace(sessionId: string): void {
     cancelDeleteGrace(sessionId);
     console.log(
-      `[MCP] Session DELETE — giữ ${SESSION_DELETE_GRACE_MS / 1000}s để tool call đang chạy: ${sessionId}`
+      `[MCP] Session DELETE — held ${SESSION_DELETE_GRACE_MS / 1000}s for in-flight tool calls: ${sessionId}`
     );
     deleteGraceTimers[sessionId] = setTimeout(() => {
       delete deleteGraceTimers[sessionId];
@@ -198,7 +218,9 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
         }
       },
       onsessionclosed: (sid) => {
-        if (sid) scheduleDeleteGrace(sid);
+        if (!sid) return;
+        if (sessions[sid]) sessions[sid].closedByClient = true;
+        scheduleDeleteGrace(sid);
       },
     });
 
@@ -285,16 +307,7 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
       return Object.keys(sessions).length;
     },
 
-    sendSessionNotFound(res: Response, requestId: string | number | null = null) {
-      const message =
-        "Session not found. Server restarted or connector session expired — refresh connector and open a new chat.";
-      res.locals.mcpError = message;
-      res.status(404).json({
-        jsonrpc: "2.0",
-        error: { code: -32001, message },
-        id: requestId,
-      });
-    },
+    sendSessionNotFound,
 
     sendBadRequest(res: Response, message: string, requestId: string | number | null = null) {
       res.locals.mcpError = message;
@@ -339,11 +352,32 @@ export function createSessionManager(config: SessionManagerConfig): SessionManag
     ): Promise<void> {
       const sid =
         session.transport.sessionId || (req.headers["mcp-session-id"] as string | undefined);
+
+      // A session the client already closed keeps its entry for a moment so a
+      // running tool call can finish, but its transport will not answer anything
+      // new — a POST arriving now used to be accepted and then simply never
+      // replied to. Saying so lets the client open a fresh session instead of
+      // waiting on one that is gone.
+      if (session.closedByClient) {
+        sendSessionNotFound(res, extractRequestId(body ?? req.body));
+        return;
+      }
+
       if (sid) touch(sid);
       const run = async () => {
         await session.transport.handleRequest(req, res, body);
       };
-      if (sid) {
+      // GET is the one method left out of the queue. It opens the standalone SSE
+      // stream and does not return until the client closes it, so queueing it
+      // left every later POST on that session waiting on a stream that never
+      // ends — a client that opened one could not call a single tool afterwards.
+      //
+      // DELETE stays in the queue. Letting it past closes the transport out from
+      // under a tool call that is still running, and that call is then never
+      // answered at all: the client waits for a reply that cannot arrive. Behind
+      // the queue it closes the session the moment the work in front of it is
+      // done, which is both prompt and safe.
+      if (sid && req.method !== "GET") {
         await enqueueSessionOp(sid, run);
       } else {
         await run();

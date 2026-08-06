@@ -78,7 +78,7 @@ function resolveCdTarget(current: string, target: string): string {
   return path.isAbsolute(cleaned) ? path.resolve(cleaned) : path.resolve(current, cleaned);
 }
 
-/** Cập nhật cwd khi gặp cd / Set-Location ở đầu command (giống Bash persistent). */
+/** Track cwd across a leading cd / Set-Location, the way a persistent shell does. */
 export function applyCwdDirectives(currentCwd: string, command: string): { cwd: string; command: string } {
   let cwd = currentCwd;
   let rest = command.trim();

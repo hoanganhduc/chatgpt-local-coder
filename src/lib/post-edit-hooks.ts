@@ -11,6 +11,7 @@
 import fs from "fs/promises";
 import path from "path";
 import { spawn } from "child_process";
+import { StringDecoder } from "string_decoder";
 import { fileURLToPath } from "url";
 import { registerInternalHook } from "../hooks/engine.js";
 import { requireCommandAllowed } from "./permissions.js";
@@ -141,11 +142,18 @@ function runHook(
     // otherwise be appended to until the append itself threw, inside a stream
     // listener where nothing catches it. Still read after the cap, since a
     // stream left unread fills its pipe and blocks the checker on it.
+    //
+    // One decoder per stream, held across chunks: a linter reporting a filename
+    // or a message in the user's own language is exactly the output whose
+    // characters span more than one byte, and decoding each chunk alone put
+    // U+FFFD into the diagnostic the caller has to read.
+    const outDecoder = new StringDecoder("utf8");
+    const errDecoder = new StringDecoder("utf8");
     child.stdout.on("data", (d: Buffer) => {
-      if (stdout.length < MAX_HOOK_OUTPUT) stdout += d.toString();
+      if (stdout.length < MAX_HOOK_OUTPUT) stdout += outDecoder.write(d);
     });
     child.stderr.on("data", (d: Buffer) => {
-      if (stderr.length < MAX_HOOK_OUTPUT) stderr += d.toString();
+      if (stderr.length < MAX_HOOK_OUTPUT) stderr += errDecoder.write(d);
     });
     child.on("close", (code) => {
       clearTimeout(timer);

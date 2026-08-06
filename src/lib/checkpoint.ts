@@ -2,6 +2,8 @@ import fs from "fs/promises";
 import path from "path";
 import { randomUUID, createHash } from "node:crypto";
 
+import { stateDir } from "../config/paths.js";
+
 export interface CheckpointFileSnapshot {
   path: string;
   existed: boolean;
@@ -47,8 +49,18 @@ function isEnabled(): boolean {
   return !["0", "false", "no", "off"].includes(raw);
 }
 
+/**
+ * Where rewind snapshots live.
+ *
+ * This used to resolve against process.cwd(), which put the store wherever the
+ * server happened to be launched from — under a service that is the unit's
+ * WorkingDirectory, so file snapshots of the workspace were landing in an
+ * unrelated directory such as ~/Downloads, outside the workspace and outside
+ * the state directory. The state directory is the one location that does not
+ * move with how the process was started.
+ */
 function getStoreRoot(): string {
-  return process.env.CHECKPOINT_PATH || path.resolve(process.cwd(), ".mcp-checkpoints");
+  return process.env.CHECKPOINT_PATH || path.join(stateDir(), "checkpoints");
 }
 
 function getMaxCount(): number {

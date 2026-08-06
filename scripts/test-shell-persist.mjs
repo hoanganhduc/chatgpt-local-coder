@@ -73,7 +73,11 @@ try {
 
   const result = await execInShellSession(`node "${noisy}"`, root, 60000);
   if (result.exit_code !== 0) throw new Error(`exit ${result.exit_code}: ${result.stderr}`);
-  if (result.stdout.length > 4_000_000) {
+  // The cap is 2 MB and the cut happens inside the arriving chunk, so this is
+  // exactly 2,000,036 chars — the cap plus the truncation notice. A looser
+  // bound was leftover from the superseded between-chunks cap, which overshoots
+  // into 2,001,188-2,045,284 and would slip past 4_000_000 every time.
+  if (result.stdout.length > 2_001_000) {
     throw new Error(`kept ${result.stdout.length} chars of an 8MB command`);
   }
   if (result.truncated !== true) throw new Error("output was dropped without saying so");

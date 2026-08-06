@@ -131,7 +131,17 @@ export async function runUp(argv: string[], cwd = process.cwd()): Promise<number
   process.on("SIGTERM", () => void shutdown(0));
 
   const childExit = new Promise<number>((resolve) => {
-    child.on("exit", (code) => resolve(code ?? 1));
+    child.on("exit", (code, signal) => {
+      // A signalled exit arrives with a null code, which used to be reported as
+      // a plain failure — so a restart, an OOM kill and a genuine crash all left
+      // the same "exited 1" in the log and none of them could be told apart.
+      if (signal) {
+        console.error(`Server was terminated by ${signal}.`);
+        resolve(1);
+        return;
+      }
+      resolve(code ?? 1);
+    });
     child.on("error", (error) => {
       console.error(`Server failed to start: ${error.message}`);
       resolve(1);

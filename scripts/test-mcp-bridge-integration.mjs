@@ -98,16 +98,30 @@ await fs.writeFile(
   "utf-8"
 );
 
+const ADMIN_TOKEN = "bridge-integration-admin-token";
 const mockHttp = spawnNode(path.join(root, "scripts/mock-http-mcp.mjs"), { MOCK_HTTP_MCP_PORT: String(mockPort) });
 const hub = spawnNode(path.join(root, "dist/index.js"), {
   PORT: String(mcpPort),
   ADMIN_PORT: String(adminPort),
   MCP_UPSTREAM_CONFIG: configPath,
   WORKSPACE_PATH: root,
+  // The admin API is closed by default. Whether it refuses an unauthenticated
+  // caller is test-http-access.mjs's job; here the token is simply presented.
+  ADMIN_TOKEN,
+  // The bridge tools this test exercises — mcp_tools and mcp_call — are not in
+  // SLIM_CHATGPT_TOOLS, so the default profile replaces them with a no-op and
+  // the first tools/call below fails with -32602. Every sibling server test
+  // pins the profile for the same reason.
+  CHATGPT_TOOL_PROFILE: "full",
 });
+
+/** Admin request headers, so every call below goes through the same door. */
+const adminHeaders = (extra = {}) => ({ Authorization: `Bearer ${ADMIN_TOKEN}`, ...extra });
 
 let hubLog = "";
 let mockLog = "";
+/** Exiting from the catch would skip the finally, leaving both children alive. */
+let failed = false;
 hub.stdout.on("data", (d) => (hubLog += d.toString()));
 hub.stderr.on("data", (d) => (hubLog += d.toString()));
 mockHttp.stdout.on("data", (d) => (mockLog += d.toString()));
@@ -185,7 +199,7 @@ try {
   const enableProxy = await (
     await fetch(`http://127.0.0.1:${adminPort}/api/upstream`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: adminHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({
         server: {
           id: "mockhttp",
@@ -219,7 +233,7 @@ try {
   const proxiedPayload = JSON.parse(proxied.result.content[0].text);
   if (!proxiedPayload.ok) throw new Error(JSON.stringify(proxiedPayload));
 
-  const adminHtml = await (await fetch(`http://127.0.0.1:${adminPort}/ui/`)).text();
+  const adminHtml = await (await fetch(`http://127.0.0.1:${adminPort}/ui/`, { headers: adminHeaders() })).text();
   if (!adminHtml.includes("Import") || !adminHtml.includes("Claude Code") || !adminHtml.includes("OpenCode")) {
     throw new Error("admin ui missing expected import controls");
   }
@@ -233,7 +247,7 @@ try {
   const imported = await (
     await fetch(`http://127.0.0.1:${adminPort}/api/import/cursor`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: adminHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ path: fixture, merge: true }),
     })
   ).json();
@@ -259,8 +273,11 @@ try {
   await fs.writeFile(path.join(scratch, "integration-error.log"), String(err?.stack || err));
   console.error("FAIL bridge integration:", err.message || err);
   console.error(hubLog.slice(-2000));
-  process.exit(1);
+  failed = true;
 } finally {
   hub.kill("SIGTERM");
   mockHttp.kill("SIGTERM");
+  // Orphaned children keep their ports, so a failed run used to make the *next*
+  // run fail with a misleading "fetch failed" rather than its own error.
+  if (failed) process.exit(1);
 }

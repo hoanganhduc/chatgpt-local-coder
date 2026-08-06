@@ -1,9 +1,10 @@
 import type { ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 
 /**
- * ChatGPT dùng tool annotations để quyết định có hỏi Allow/Deny không.
- * Khi CHATGPT_AUTO_APPROVE=true (mặc định): đánh dấu MỌI tool là routine/local
- * để giảm popup và tránh "Luôn cho phép" làm reset session.
+ * ChatGPT reads tool annotations to decide whether to prompt Allow/Deny.
+ * With CHATGPT_AUTO_APPROVE=true (the default) every tool is marked
+ * routine/local, which keeps the prompts down and avoids "Always allow"
+ * resetting the session.
  */
 export function isChatGptAutoApproveEnabled(): boolean {
   const raw = (process.env.CHATGPT_AUTO_APPROVE ?? "true").trim().toLowerCase();
@@ -12,25 +13,31 @@ export function isChatGptAutoApproveEnabled(): boolean {
 
 export type ToolRisk = "read" | "edit" | "command" | "destructive";
 
-export function toolAnnotations(risk: ToolRisk): ToolAnnotations {
-  if (risk === "read") {
-    return { readOnlyHint: true, openWorldHint: false };
-  }
+export interface ToolRiskOptions {
+  /** The tool can reach beyond this machine — a push, a fetch, a delegate CLI. */
+  openWorld?: boolean;
+}
 
-  if (isChatGptAutoApproveEnabled()) {
-    // Tất cả write/command/delete đều đánh dấu routine edit — không destructive.
-    return {
-      readOnlyHint: false,
-      destructiveHint: false,
-      openWorldHint: false,
-      idempotentHint: risk !== "command",
-    };
+/**
+ * Auto-approve trades prompts for convenience; it does not get to relabel the
+ * work. `destructiveHint` used to be forced to false for every tool whenever
+ * auto-approve was on — its default — so a recursive delete and a `git_reset
+ * --hard` advertised themselves exactly as a file write did, and the promise
+ * that the client asks before important changes had nothing left to key on.
+ * What auto-approve now changes is how routine an edit looks, never whether an
+ * irreversible operation is announced as one.
+ */
+export function toolAnnotations(risk: ToolRisk, options: ToolRiskOptions = {}): ToolAnnotations {
+  const openWorldHint = options.openWorld ?? false;
+
+  if (risk === "read") {
+    return { readOnlyHint: true, openWorldHint };
   }
 
   return {
     readOnlyHint: false,
     destructiveHint: risk === "destructive",
-    openWorldHint: false,
-    idempotentHint: risk === "edit",
+    openWorldHint,
+    idempotentHint: isChatGptAutoApproveEnabled() ? risk !== "command" : risk === "edit",
   };
 }

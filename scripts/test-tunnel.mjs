@@ -63,6 +63,7 @@ const {
   buildStatusArgs,
   buildStopArgs,
   defaultProfileDir,
+  readinessCaveat,
   tunnelConnect,
   tunnelCreate,
   tunnelStatus,
@@ -600,6 +601,38 @@ await checkAsync("archive member names that escape the destination are refused",
 
 check("a buffer with no end-of-central-directory is rejected", () => {
   throws(() => readZipEntries(Buffer.alloc(64)), /no end-of-central-directory/, "not a zip");
+});
+
+// --- "healthy" is about the runtime, not about the host behind it --------
+//
+// The client reports `healthy: true` once its own process is up and talking to
+// the control plane, and records separately — in the readyz body — that it
+// never reached the MCP server. Reporting only the flag told a user whose host
+// was unreachable that everything was fine.
+check("a readyz caveat is surfaced even though the runtime calls itself healthy", () => {
+  const caveat = readinessCaveat({
+    healthy: true,
+    local: {
+      effective_health: {
+        readyz: { ok: true, status: 200, body: "ready (mcp startup probe timed out: mcp probe timed out after 2s)" },
+      },
+    },
+  });
+  if (!caveat) throw new Error("a qualified readiness was reported as plain readiness");
+  if (!caveat.includes("mcp startup probe timed out")) throw new Error(`caveat lost its reason: ${caveat}`);
+});
+
+check("a runtime that is genuinely ready reports no caveat", () => {
+  const caveat = readinessCaveat({
+    healthy: true,
+    local: { effective_health: { readyz: { ok: true, status: 200, body: "ready" } } },
+  });
+  if (caveat) throw new Error(`invented a caveat: ${caveat}`);
+});
+
+check("status JSON without a readyz body is handled", () => {
+  if (readinessCaveat(undefined)) throw new Error("read a caveat out of nothing");
+  if (readinessCaveat({ healthy: true })) throw new Error("read a caveat out of a bare status");
 });
 
 await fs.rm(tmp, { recursive: true, force: true });

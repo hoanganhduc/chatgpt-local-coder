@@ -56,7 +56,7 @@ export function registerDelegateTools(server: McpServer, opts: DelegateToolOptio
         cwd: z.string().optional().describe("Working directory for the delegate; must be allowed by the permission profile"),
         timeout_sec: z.number().int().positive().optional().describe("Overrides delegates.timeoutSec (capped by it)"),
       },
-      annotations: toolAnnotations("command"),
+      annotations: toolAnnotations("command", { openWorld: true }),
     },
     async ({ prompt, agent, skill, cwd, timeout_sec }) => {
       let body: string | undefined;

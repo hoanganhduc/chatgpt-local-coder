@@ -14,6 +14,7 @@ import { buildServerInstructions } from "./lib/quickstart.js";
 import type { McpUpstreamManager } from "./lib/mcp-upstream-manager.js";
 import { refreshProxiedTools } from "./lib/mcp-tool-proxy.js";
 import { getChatGptToolProfile, shouldExposeTool } from "./lib/tool-profile.js";
+import { applyErrorEnvelope } from "./lib/tool-envelope.js";
 
 const NOOP_TOOL = {
   remove: () => {},
@@ -68,6 +69,10 @@ export function createMcpServer(
     }
   );
 
+  // Applied first, so it ends up outermost: each wrapper wraps the callback the
+  // next one hands it, and a throw from a hook has to be caught as well as a
+  // throw from the tool.
+  applyErrorEnvelope(server);
   applyToolProfile(server);
   // Wrapped after the profile filter so a tool the profile hides never gets a
   // hook wrapper it will not use.

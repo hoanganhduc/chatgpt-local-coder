@@ -14,6 +14,7 @@ import { getSecret, secretFileReference } from "../../lib/secrets.js";
 import {
   defaultProfileDir,
   installTunnelBinary,
+  readinessCaveat,
   resolveTunnelBinary,
   tunnelConnect,
   tunnelCreate,
@@ -66,6 +67,10 @@ function report(result: TunnelCommandResult, asJson: boolean): number {
   } else {
     if (result.stdout) console.log(result.stdout);
     if (result.stderr) console.error(result.stderr);
+    // The runtime reports `healthy: true` for itself while recording separately
+    // that it never reached the MCP host. Printing the JSON as-is buried that.
+    const caveat = readinessCaveat(result.json);
+    if (caveat) console.error(`WARNING: the runtime is up but not fully ready — ${caveat}`);
   }
   return result.ok ? 0 : 1;
 }
@@ -118,6 +123,13 @@ export function describeConnect(result: ConnectResult): string {
     `  health url: ${result.healthUrl ?? "unknown"}`,
     `  config:     ${result.configPath ?? "unknown"}`,
   ];
+  // "Healthy" is about the runtime, not about the host behind it. When the
+  // runtime says it is ready but qualifies it, the qualification is the part
+  // worth reading.
+  if (result.readinessCaveat) {
+    lines.push(`  WARNING:    the runtime is up but not fully ready — ${result.readinessCaveat}`);
+    lines.push(`              check the host is running: chatgpt-local-coder status`);
+  }
   if (result.logPath) lines.push(`  log:        ${result.logPath}`);
   if (result.waitedMs !== undefined) lines.push(`  waited:     ${Math.round(result.waitedMs / 1000)}s`);
   if (result.logTail) lines.push("", "Log tail:", result.logTail);

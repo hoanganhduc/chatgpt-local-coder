@@ -7,6 +7,7 @@ import { execFile, spawn } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
+import { StringDecoder } from "string_decoder";
 
 export type PlatformId = "win32" | "darwin" | "linux";
 export type ArchId = "amd64" | "arm64";
@@ -516,6 +517,15 @@ export function runExecutable(
 
     const captured = { stdout: "", stderr: "" };
     const dropped = { stdout: false, stderr: false };
+    // One decoder per stream, held across chunks. A chunk boundary falls
+    // wherever the OS happened to stop, which for any non-ASCII output lands
+    // mid-character sooner or later; decoding each chunk on its own turned the
+    // two halves into a pair of U+FFFD and reported truncated:false while doing
+    // it. The decoder holds the incomplete tail until the bytes that finish it
+    // arrive. It is deliberately not flushed at the end: an unfinished
+    // character there means the command truly stopped mid-sequence, and
+    // dropping those bytes is better than inventing a replacement glyph.
+    const decoders = { stdout: new StringDecoder("utf8"), stderr: new StringDecoder("utf8") };
     let timedOut = false;
     let settled = false;
     let drainTimer: NodeJS.Timeout | undefined;
@@ -573,7 +583,7 @@ export function runExecutable(
         dropped[key] = true;
         return;
       }
-      const text = chunk.toString();
+      const text = decoders[key].write(chunk);
       if (text.length <= room) {
         captured[key] += text;
         return;

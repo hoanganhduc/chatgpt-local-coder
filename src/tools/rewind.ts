@@ -38,7 +38,7 @@ export function registerRewindTools(server: McpServer): void {
           .default(30)
           .describe("Max checkpoints to return for list"),
       },
-      annotations: toolAnnotations("edit"),
+      annotations: toolAnnotations("destructive"),
     },
     async ({ action, checkpoint_id, limit }) => {
       if (action === "status") {

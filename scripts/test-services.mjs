@@ -22,6 +22,7 @@ import {
   TASK_NAME,
   taskXmlPath,
   UNIT_NAME,
+  rotateServerLog,
 } from "../dist/services/index.js";
 
 let passed = 0;
@@ -245,6 +246,45 @@ await checkAsync("generating a plan writes nothing to disk", async () => {
     homeExists = false;
   }
   assert(!homeExists, "the fake home directory should never have been created");
+});
+
+// ------------------------------------------------------------ log rotation
+// The supervisor opens the log itself and hands the descriptor to the server,
+// so rotation has to copy-and-truncate. Renaming would leave the descriptor on
+// the rotated inode and every later line would vanish from the live file.
+await checkAsync("rotateServerLog leaves a small log alone", async () => {
+  const small = path.join(tmp, "small.log");
+  await fs.writeFile(small, "one line\n");
+  assert((await rotateServerLog(small)) === false, "a small log should not roll over");
+  assert((await fs.readFile(small, "utf-8")) === "one line\n", "contents were altered");
+  let rotatedExists = true;
+  try { await fs.access(`${small}.1`); } catch { rotatedExists = false; }
+  assert(!rotatedExists, "no .1 should be produced below the threshold");
+});
+
+await checkAsync("rotateServerLog rolls a large log over and keeps the inode", async () => {
+  const big = path.join(tmp, "big.log");
+  const payload = "x".repeat(9 * 1024 * 1024);
+  await fs.writeFile(big, payload);
+  const inodeBefore = (await fs.stat(big)).ino;
+
+  const handle = await fs.open(big, "a");
+  try {
+    assert((await rotateServerLog(big)) === true, "a log past the cap should roll over");
+    assert((await fs.stat(big)).size === 0, "the live log should be empty after rotation");
+    assert((await fs.stat(big)).ino === inodeBefore, "the descriptor's inode must survive");
+    assert((await fs.readFile(`${big}.1`, "utf-8")).length === payload.length, "history was not preserved");
+
+    // The held descriptor must still land in the file everyone is reading.
+    await handle.write("after rotation\n");
+    assert((await fs.readFile(big, "utf-8")) === "after rotation\n", "writes went somewhere else");
+  } finally {
+    await handle.close();
+  }
+});
+
+await checkAsync("rotateServerLog is a no-op when there is no log yet", async () => {
+  assert((await rotateServerLog(path.join(tmp, "absent.log"))) === false, "a missing log is not an error");
 });
 
 await fs.rm(tmp, { recursive: true, force: true });

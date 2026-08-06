@@ -89,9 +89,16 @@ function writeConsole(entry: ActivityEntry): void {
     const label =
       entry.tool ? `tools/call ${entry.tool}` : entry.action || entry.kind || "mcp";
     const detail = entry.summary || entry.target || "";
-    const http = entry.details?.http_status != null ? ` HTTP ${entry.details.http_status}` : "";
+    const status = entry.details?.http_status;
+    // A tool that refuses or fails still answers HTTP 200 — the failure is in
+    // the envelope, not the transport. Printing "[MCP ERROR] HTTP 200" put a
+    // working permission check next to genuine faults under the same word and
+    // the same status code, which is the opposite of what a log is for.
+    const transportFailed = typeof status === "number" && status >= 400;
+    const tag = transportFailed ? "[MCP ERROR]" : entry.status === "blocked" ? "[MCP BLOCKED]" : "[MCP FAIL]";
+    const http = transportFailed ? ` HTTP ${status}` : "";
     console.warn(
-      `[MCP ERROR]${http} ${label}${detail ? ` — ${detail}` : ""}${dur}${sid}`
+      `${tag}${http} ${label}${detail ? ` — ${detail}` : ""}${dur}${sid}`
     );
     return;
   }
@@ -194,7 +201,9 @@ export function logMcpRequest(
   sessionId: string | undefined,
   durationMs: number,
   httpStatus: number,
-  errorMessage?: string
+  errorMessage?: string,
+  /** The reply carried `isError` — a tool call that failed inside an HTTP 200. */
+  toolFailed = false
 ): void {
   if (typeof body !== "object" || body === null) {
     if (httpStatus >= 400) {
@@ -210,7 +219,7 @@ export function logMcpRequest(
     return;
   }
   const rpc = body as { method?: string; params?: { name?: string; arguments?: unknown; protocolVersion?: string } };
-  const isError = httpStatus >= 400;
+  const isError = httpStatus >= 400 || toolFailed;
   const argSummary =
     rpc.method === "tools/call" && rpc.params?.name
       ? summarizeToolArgs(rpc.params.name, rpc.params.arguments)

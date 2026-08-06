@@ -12,8 +12,14 @@ export const SLIM_CHATGPT_TOOLS = new Set([
   "list_directory",
   "run_command",
   "shell_status",
+  // A background job needs the tools that end it as well as the one that starts
+  // it. Slim used to offer `start_process` alone, so a model could take a port
+  // and then have no way to give it back.
   "start_process",
   "process_output",
+  "process_status",
+  "stop_process",
+  "clear_processes",
   "git_status",
   "git_diff",
   "git_add",

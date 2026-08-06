@@ -1,4 +1,5 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "child_process";
+import { StringDecoder } from "string_decoder";
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { validatePath } from "../lib/path-security.js";
@@ -29,8 +30,8 @@ interface ManagedProcess {
 const processes = new Map<string, ManagedProcess>();
 const MAX_LOG_CHARS = 400_000;
 
-function appendLog(lines: string[], data: Buffer): void {
-  lines.push(data.toString());
+function appendLog(lines: string[], decoder: StringDecoder, data: Buffer): void {
+  lines.push(decoder.write(data));
   let total = lines.reduce((sum, item) => sum + item.length, 0);
   while (total > MAX_LOG_CHARS && lines.length > 1) {
     const removed = lines.shift();
@@ -52,7 +53,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         working_directory: z.string().optional().describe("One-off override; does not reset persistent cwd unless you use shell_reset"),
       },
 
-      annotations: toolAnnotations("command"),
+      annotations: toolAnnotations("command", { openWorld: true }),
     },
     async ({ command, working_directory }) => {
       requireCommandAllowed(command);
@@ -110,7 +111,7 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
       description: "Start a long-running command in the background. Use process_output/process_status/stop_process afterwards.",
       inputSchema: { command: z.string(), working_directory: z.string().optional() },
 
-      annotations: toolAnnotations("command"),
+      annotations: toolAnnotations("command", { openWorld: true }),
     },
     async ({ command, working_directory }) => {
       requireCommandAllowed(command);
@@ -142,8 +143,15 @@ export function registerShellTools(server: McpServer, defaultCwd: string, timeou
         signal: null,
       };
       processes.set(id, item);
-      child.stdout.on("data", (d: Buffer) => appendLog(item.stdout, d));
-      child.stderr.on("data", (d: Buffer) => appendLog(item.stderr, d));
+      // One decoder per stream, held for the life of the process. A background
+      // job logs for as long as it runs, so it crosses far more chunk
+      // boundaries than a one-shot command does, and each one that fell
+      // mid-character used to leave a pair of U+FFFD in the log the caller
+      // later reads back.
+      const outDecoder = new StringDecoder("utf8");
+      const errDecoder = new StringDecoder("utf8");
+      child.stdout.on("data", (d: Buffer) => appendLog(item.stdout, outDecoder, d));
+      child.stderr.on("data", (d: Buffer) => appendLog(item.stderr, errDecoder, d));
       // Recorded on `exit` rather than `close`. `close` waits for the stdio
       // pipes as well, and a job that leaves something holding them would keep
       // this reporting `running` long after the process itself was gone — which

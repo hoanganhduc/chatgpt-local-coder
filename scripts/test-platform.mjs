@@ -140,15 +140,42 @@ try {
     { timeoutMs: 30000, maxOutputBytes: 1000 }
   );
   if (result.exitCode !== 0) throw new Error(`exit ${result.exitCode}: ${result.stderr}`);
-  // One chunk of overshoot is expected: a chunk that arrives under the cap is
-  // taken whole rather than cut, so a multi-byte character cannot be halved.
-  if (result.stdout.length > 200_000) {
+  // The cut happens inside the arriving chunk, so this is exactly 1033 chars —
+  // the 1000-char cap plus the 33-char truncation notice. The old 200_000 bound
+  // described the superseded between-chunks policy, under which a whole chunk
+  // was taken or refused; a POSIX pipe hands over at most 64KB at a time, so
+  // reverting to that policy keeps ~65,569 chars here and the loose bound could
+  // never once have fired.
+  if (result.stdout.length > 1100) {
     throw new Error(`kept ${result.stdout.length} chars against a 1000-byte cap`);
   }
   if (result.truncated !== true) throw new Error("output was dropped without saying so");
   if (!/truncated/.test(result.stdout)) throw new Error("nothing in the output says it is incomplete");
   ok("runExecutable bounds what it captures and reports what it dropped");
 } catch (e) { fail("runExecutable output cap", e.message); }
+
+try {
+  // Every character here is multi-byte, and the output is far larger than the
+  // 64KB a pipe hands over at once, so chunk boundaries are guaranteed to fall
+  // mid-character. Decoding each chunk on its own replaced both halves with
+  // U+FFFD and still reported truncated:false, which is the worst shape a
+  // failure can take: the caller is told the output is complete while the text
+  // it reads has been altered.
+  const line = "Tiếng Việt: đường đi khó, không khó vì ngăn sông cách núi — ";
+  const result = await runExecutable(
+    process.execPath,
+    ["-e", `let s=""; while (Buffer.byteLength(s,"utf8") < 700000) s += ${JSON.stringify(line)}; process.stdout.write(s);`],
+    { timeoutMs: 30000, maxOutputBytes: 10_000_000 }
+  );
+  if (result.exitCode !== 0) throw new Error(`exit ${result.exitCode}: ${result.stderr}`);
+  if (result.truncated) throw new Error("output was truncated; the cap is meant to be well clear of it");
+  const replacements = (result.stdout.match(/�/g) || []).length;
+  if (replacements > 0) {
+    throw new Error(`${replacements} character(s) were corrupted at chunk boundaries`);
+  }
+  if (!result.stdout.endsWith("núi —")) throw new Error("the tail of the output did not survive");
+  ok("runExecutable holds multi-byte characters across chunk boundaries");
+} catch (e) { fail("runExecutable utf-8 decoding", e.message); }
 
 try {
   const shell = defaultShell();

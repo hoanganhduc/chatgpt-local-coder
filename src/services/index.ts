@@ -28,6 +28,36 @@ export function defaultLogPath(): string {
   return path.join(stateDir(), "server.log");
 }
 
+const LOG_ROTATE_BYTES = parseInt(process.env.CLC_LOG_MAX_BYTES || String(8 * 1024 * 1024), 10);
+
+/**
+ * Roll the server log over if the previous runs left it large.
+ *
+ * Copy-and-truncate rather than rename: all three supervisors redirect stdout
+ * by opening the file themselves, so by the time the server process runs, the
+ * descriptor is already held. Renaming would move the inode out from under it
+ * and every later line would land in the rotated file, invisible to anyone
+ * reading the live one. Truncating keeps the descriptor valid — an append-mode
+ * write goes to the current end, which is now zero.
+ *
+ * Called once at boot rather than on a timer, because a mid-run truncation
+ * races the writes it is trying to bound. Set CLC_LOG_MAX_BYTES=0 to disable.
+ */
+export async function rotateServerLog(logPath: string = defaultLogPath()): Promise<boolean> {
+  if (!Number.isFinite(LOG_ROTATE_BYTES) || LOG_ROTATE_BYTES <= 0) return false;
+  try {
+    const stat = await fs.stat(logPath);
+    if (stat.size < LOG_ROTATE_BYTES) return false;
+    await fs.copyFile(logPath, `${logPath}.1`);
+    await fs.truncate(logPath, 0);
+    return true;
+  } catch {
+    // No log yet, or a read-only location: nothing to roll over, and failing to
+    // rotate is never a reason to refuse to start.
+    return false;
+  }
+}
+
 /**
  * Build the plan for a platform. The platform is a parameter rather than a
  * lookup so the generators can be asserted for all three from one machine.

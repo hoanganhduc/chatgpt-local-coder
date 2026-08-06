@@ -4,13 +4,16 @@
   "description": "Turn ChatGPT web into a local coding agent via MCP — files, shell, git, apply_patch, 40+ tools",
   "repository": {
     "type": "git",
-    "url": "https://github.com/hoangcoderr/chatgpt-local-coder.git"
+    "url": "https://github.com/hoanganhduc/chatgpt-local-coder.git"
   },
-  "homepage": "https://github.com/hoangcoderr/chatgpt-local-coder#readme",
+  "homepage": "https://github.com/hoanganhduc/chatgpt-local-coder#readme",
   "bugs": {
-    "url": "https://github.com/hoangcoderr/chatgpt-local-coder/issues"
+    "url": "https://github.com/hoanganhduc/chatgpt-local-coder/issues"
   },
-  "author": "hoangcoderr",
+  "author": "Duc A. Hoang",
+  "contributors": [
+    "hoangcoderr"
+  ],
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -20,7 +23,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node scripts/test-platform.mjs && node scripts/test-config.mjs && node scripts/test-secrets.mjs && node scripts/test-permissions.mjs && node scripts/test-skills.mjs && node scripts/test-settings.mjs && node scripts/test-delegates.mjs && node scripts/test-hooks.mjs && node scripts/test-tunnel.mjs && node scripts/test-services.mjs && node scripts/test-cli.mjs && node scripts/test-patch.mjs && node scripts/test-tools.mjs && node scripts/test-checkpoints.mjs && node scripts/test-mcp-upstream.mjs && node scripts/test-activity-log.mjs && node scripts/test-project-memory.mjs && node scripts/test-tool-profile.mjs && node scripts/test-shell-persist.mjs && node scripts/test-background-process.mjs && node scripts/test-git-run.mjs",
+    "test": "npm run build && node scripts/test-platform.mjs && node scripts/test-config.mjs && node scripts/test-secrets.mjs && node scripts/test-permissions.mjs && node scripts/test-skills.mjs && node scripts/test-settings.mjs && node scripts/test-delegates.mjs && node scripts/test-hooks.mjs && node scripts/test-tunnel.mjs && node scripts/test-services.mjs && node scripts/test-cli.mjs && node scripts/test-patch.mjs && node scripts/test-tools.mjs && node scripts/test-checkpoints.mjs && node scripts/test-mcp-upstream.mjs && node scripts/test-activity-log.mjs && node scripts/test-project-memory.mjs && node scripts/test-tool-profile.mjs && node scripts/test-tool-failure.mjs && node scripts/test-shell-persist.mjs && node scripts/test-background-process.mjs && node scripts/test-git-run.mjs",
     "test:all": "node scripts/run-all-tests.mjs",
     "test:integration": "npm run build && node scripts/test-mcp-bridge-integration.mjs",
     "init-claude-md": "node scripts/init-claude-md.mjs",

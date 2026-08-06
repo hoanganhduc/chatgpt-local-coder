@@ -150,7 +150,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
         .describe("Revision to restore from (default HEAD)"),
     },
 
-    annotations: toolAnnotations("edit"),
+    annotations: toolAnnotations("destructive"),
   }, async ({ path: repoPath, files, source }) => {
     requireWriteAllowed();
     const cwd = await repo(repoPath, "write");
@@ -181,7 +181,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
       set_upstream: z.boolean().optional().default(false),
     },
 
-    annotations: toolAnnotations("edit"),
+    annotations: toolAnnotations("edit", { openWorld: true }),
   }, async ({ path: repoPath, remote, branch, set_upstream }) => {
     requireWriteAllowed();
     const cwd = await repo(repoPath, "write");
@@ -208,7 +208,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
       "Download updates from the repository's configured remote into the local working copy.",
     inputSchema: { path: z.string().optional(), remote: z.string().optional().default("origin"), branch: z.string().optional() },
 
-    annotations: toolAnnotations("edit"),
+    annotations: toolAnnotations("edit", { openWorld: true }),
   }, async ({ path: repoPath, remote, branch }) => {
     requireWriteAllowed();
     const cwd = await repo(repoPath, "write");
@@ -252,7 +252,7 @@ export function registerGitTools(server: McpServer, defaultCwd: string): void {
       ref: z.string().optional().default("HEAD"),
     },
 
-    annotations: toolAnnotations("edit"),
+    annotations: toolAnnotations("destructive"),
   }, async ({ path: repoPath, mode, ref }) => {
     requireWriteAllowed();
     const cwd = await repo(repoPath, "write");

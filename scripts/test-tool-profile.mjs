@@ -28,6 +28,13 @@ try {
 
   if (!shouldExposeTool("mcp_call", "full")) throw new Error("full should expose all");
   ok("full profile exposes all");
+
+  // Slim offered `start_process` with nothing that ends one, so a job that took
+  // a port had no way to give it back within the profile it was started in.
+  for (const t of ["stop_process", "process_status", "clear_processes"]) {
+    if (!shouldExposeTool(t, "slim")) throw new Error(`slim starts jobs but hides ${t}`);
+  }
+  ok("slim exposes the tools that end a background job, not only the one that starts it");
 } catch (e) {
   fail("tool profile", e.message || e);
 }

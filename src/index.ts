@@ -22,7 +22,7 @@ import {
   isInitializeRequest,
 } from "./lib/mcp-session-manager.js";
 import { initUpstreamManager } from "./lib/mcp-upstream-manager.js";
-import { startAdminServer } from "./admin/server.js";
+import { announceAdminUrl, startAdminServer } from "./admin/server.js";
 import { getSecret } from "./lib/secrets.js";
 import { logMcpHttpEvent, logMcpRequest } from "./lib/activity-log.js";
 import {
@@ -36,8 +36,21 @@ import { checkImportedRules, loadSettings } from "./settings/index.js";
 import { setHookConfig } from "./hooks/engine.js";
 import { registerPostEditHook } from "./lib/post-edit-hooks.js";
 import { detectDelegates } from "./delegates/index.js";
+import { installLogTimestamps } from "./lib/log-timestamp.js";
+import { rotateServerLog } from "./services/index.js";
+
+// Before the first line is written, so the whole boot is stamped and a log that
+// survived the previous run is not appended to indefinitely.
+await rotateServerLog();
+installLogTimestamps();
 
 const { config } = loadConfig();
+
+// `toolProfile` is read straight from the environment wherever the filter runs,
+// so a value that came from config.json has to be put back there before the
+// first server is built. The loader has already merged file, env and flag in
+// precedence order, so this writes back the answer rather than overriding one.
+process.env.CHATGPT_TOOL_PROFILE = config.toolProfile;
 
 const PORT = config.port;
 const ADMIN_PORT = config.adminPort;
@@ -100,7 +113,7 @@ if (instructionContext.git.is_repo) {
 console.log(
   `[MCP] MCP instructions: ${Math.round(instructionContext.instructionBytes / 1024)}KB (agent prompt + env + git + memory)`
 );
-console.log(`[MCP] Tool profile: ${getChatGptToolProfile()} (CHATGPT_TOOL_PROFILE)`);
+console.log(`[MCP] Tool profile: ${getChatGptToolProfile()}`);
 console.log(
   `[MCP] Skills: ${skillRegistry.skills.length} from ${skillRegistry.roots.length} root(s)` +
     (skillRegistry.shadowed.length ? `, ${skillRegistry.shadowed.length} shadowed` : "")
@@ -142,13 +155,76 @@ const sessionManager = createSessionManager({
 });
 
 const app = express();
-app.use(cors());
+
+// No browser origin is allowed by default. This listener answers `run_command`,
+// so a page the user happens to have open must not be able to call it: `cors()`
+// with no arguments returned `Access-Control-Allow-Origin: *`, which let any
+// site preflight successfully and then read the output of a command it had run
+// on this machine. Denying the preflight is what stops it — the tunnel client
+// and every other non-browser caller are unaffected, since CORS is enforced by
+// browsers alone. Set CLC_ALLOWED_ORIGINS if you genuinely drive this host from
+// a web page.
+const allowedOrigins = (process.env.CLC_ALLOWED_ORIGINS || "")
+  .split(",")
+  .map((entry) => entry.trim())
+  .filter(Boolean);
+app.use(cors({ origin: allowedOrigins.length > 0 ? allowedOrigins : false }));
+if (allowedOrigins.length > 0) {
+  console.log(`[MCP] Browser origins allowed: ${allowedOrigins.join(", ")}`);
+}
 app.use(express.json({ limit: "50mb" }));
 const MCP_PATHS_SET = new Set(["/", "/mcp"]);
 
 app.use((req, res, next) => {
   const started = Date.now();
   const isMcpRoute = MCP_PATHS_SET.has(req.path);
+
+  // A failed tool call is an HTTP 200 carrying `isError` in the body, so the
+  // status code alone cannot tell a refusal from a success — every denied write
+  // used to be recorded as ok, which made the audit log agree with a model that
+  // had reported work it never did. The reply is watched rather than parsed: it
+  // arrives either as one JSON object or as a run of SSE frames, and only the
+  // flag matters.
+  //
+  // The quote must be unescaped. The protocol's own flag is written plainly,
+  // while the same text inside a tool's output — reading a file that happens to
+  // contain it — is JSON-escaped to `\"isError\":true`, so the lookbehind is
+  // what keeps a file's contents from being read as a verdict on the call.
+  const NEEDLE = /(?<!\\)"isError"\s*:\s*true/;
+  let toolFailed = false;
+  if (req.method === "POST" && isMcpRoute) {
+    // Carried across chunks so a boundary falling inside the token cannot hide
+    // it. Appended to, not replaced: a short write would otherwise drop the part
+    // of the token the previous chunk was holding.
+    let tail = "";
+    const watch = (chunk: unknown): void => {
+      if (toolFailed || chunk === undefined || typeof chunk === "function") return;
+      // The SDK's replies reach `res.write` as plain Uint8Array views, not Node
+      // Buffers — they come off a Web ReadableStream — so testing for a Buffer
+      // matched nothing and this check silently never fired.
+      const text =
+        typeof chunk === "string"
+          ? chunk
+          : ArrayBuffer.isView(chunk)
+            ? Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength).toString("utf-8")
+            : "";
+      if (!text) return;
+      const window = tail + text;
+      if (NEEDLE.test(window)) toolFailed = true;
+      tail = window.slice(-24);
+    };
+    const write = res.write.bind(res);
+    const end = res.end.bind(res);
+    res.write = ((chunk: unknown, ...rest: unknown[]) => {
+      watch(chunk);
+      return (write as (...a: unknown[]) => boolean)(chunk, ...rest);
+    }) as typeof res.write;
+    res.end = ((chunk: unknown, ...rest: unknown[]) => {
+      watch(chunk);
+      return (end as (...a: unknown[]) => unknown)(chunk, ...rest);
+    }) as typeof res.end;
+  }
+
   res.on("finish", () => {
     const duration = Date.now() - started;
     const sessionId = req.headers["mcp-session-id"] as string | undefined;
@@ -158,7 +234,7 @@ app.use((req, res, next) => {
       const transportError =
         consumeSessionTransportError(sessionId) ||
         (typeof res.locals.mcpError === "string" ? res.locals.mcpError : undefined);
-      logMcpRequest(req.body, sessionId, duration, res.statusCode, transportError);
+      logMcpRequest(req.body, sessionId, duration, res.statusCode, transportError, toolFailed);
       return;
     }
 
@@ -345,7 +421,10 @@ const server = app.listen(PORT, BIND_HOST, () => {
   console.log(`  MCP:       http://${display}:${PORT}/`);
   console.log(`  MCP alt:   http://${display}:${PORT}/mcp`);
   console.log(`  Health:    http://${display}:${PORT}/health`);
-  console.log(`  Admin UI:  http://127.0.0.1:${ADMIN_PORT}/ui`);
+  // The URL the admin server would answer, token and all. Printing a bare
+  // /ui here would name an address that answers 401. Off a terminal this
+  // prints the path to the file holding it rather than the token itself.
+  console.log(`  Admin UI:  ${announceAdminUrl("127.0.0.1", ADMIN_PORT)}`);
   console.log(`  Bind host: ${BIND_HOST}`);
   console.log(`  Default cwd: ${workspaceRoot}`);
   console.log(`  Permissions: ${describePermissionProfile()}`);
@@ -356,6 +435,19 @@ const server = app.listen(PORT, BIND_HOST, () => {
   console.log("========================================");
   console.log("");
 });
+
+// A tool call is a request that can legitimately produce nothing for minutes —
+// a test suite, an install, a delegate CLI. Node's defaults are written for web
+// traffic: it advertises `Keep-Alive: timeout=5` and abandons any request that
+// takes longer than five minutes, so a long build was dropped by the host that
+// started it. These are raised to sit beyond the longest call a tool can make.
+const IDLE_KEEPALIVE_MS = 65_000;
+server.keepAliveTimeout = IDLE_KEEPALIVE_MS;
+// Must exceed keepAliveTimeout, or Node races itself and closes mid-header.
+server.headersTimeout = IDLE_KEEPALIVE_MS + 5_000;
+// A shell command is already bounded by shellTimeoutSec; a second, shorter
+// deadline here would cut off calls the tool itself considers still running.
+server.requestTimeout = Math.max(SHELL_TIMEOUT * 1000 + 60_000, 600_000);
 
 server.on("error", (err: NodeJS.ErrnoException) => {
   if (err.code === "EADDRINUSE") {

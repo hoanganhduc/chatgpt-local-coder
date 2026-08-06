@@ -5,6 +5,7 @@ import {
   checkpointBefore,
   clearCheckpoints,
   listCheckpoints,
+  getCheckpointConfig,
   previewRestore,
   restoreToCheckpoint,
 } from "../dist/lib/checkpoint.js";
@@ -110,6 +111,38 @@ await run("restores move by snapshotting source and destination", async () => {
   const destText = await fs.readFile(dest, "utf-8");
   if (srcText !== "from-src\n") throw new Error(`src: ${srcText}`);
   if (destText !== "old-dest\n") throw new Error(`dest: ${destText}`);
+});
+
+// ------------------------------------------------------- default store root
+// The store used to resolve against process.cwd(), so under a service it
+// followed the unit's WorkingDirectory and wrote workspace snapshots into an
+// unrelated directory. What matters is that the location no longer depends on
+// where the process was started from.
+await run("the default store root follows the state directory, not the cwd", async () => {
+  const savedPath = process.env.CHECKPOINT_PATH;
+  const savedState = process.env.CLC_STATE_DIR;
+  const stateHome = path.join(tmpDir, "state-home");
+  delete process.env.CHECKPOINT_PATH;
+  process.env.CLC_STATE_DIR = stateHome;
+  const enteredFrom = process.cwd();
+  try {
+    const fromRoot = getCheckpointConfig().store_path;
+    if (!fromRoot.startsWith(path.resolve(stateHome))) {
+      throw new Error(`store_path ${fromRoot} is outside the state directory`);
+    }
+
+    process.chdir(path.dirname(tmpDir));
+    const fromElsewhere = getCheckpointConfig().store_path;
+    if (fromElsewhere !== fromRoot) {
+      throw new Error(`store_path moved with the cwd: ${fromRoot} -> ${fromElsewhere}`);
+    }
+  } finally {
+    process.chdir(enteredFrom);
+    if (savedPath === undefined) delete process.env.CHECKPOINT_PATH;
+    else process.env.CHECKPOINT_PATH = savedPath;
+    if (savedState === undefined) delete process.env.CLC_STATE_DIR;
+    else process.env.CLC_STATE_DIR = savedState;
+  }
 });
 
 await fs.rm(tmpDir, { recursive: true, force: true });

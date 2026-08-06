@@ -10,6 +10,7 @@ const root = path.resolve(__dirname, "..");
 
 const mcpPort = 4200 + Math.floor(Math.random() * 200);
 const adminPort = mcpPort + 1;
+const ADMIN_TOKEN = "run-all-tests-admin-token";
 
 function runNode(script, env = {}) {
   const scriptPath = path.join(root, script);
@@ -68,9 +69,15 @@ const unitScripts = [
   "scripts/test-patch.mjs",
   "scripts/test-tools.mjs",
   "scripts/test-checkpoints.mjs",
+  // Ran only under `npm test` until now, and CI runs `npm run test:all` — so the
+  // upstream-MCP proxy had eight checks that no CI job ever executed. The list
+  // here is the one that gates a merge; anything absent from it is untested in
+  // practice however carefully it was written.
+  "scripts/test-mcp-upstream.mjs",
   "scripts/test-activity-log.mjs",
   "scripts/test-project-memory.mjs",
   "scripts/test-tool-profile.mjs",
+  "scripts/test-tool-failure.mjs",
   "scripts/test-instructions.mjs",
   "scripts/test-shell-persist.mjs",
   "scripts/test-background-process.mjs",
@@ -85,7 +92,17 @@ for (const script of unitScripts) {
 
 // These spawn their own servers on their own ports, so they run before the
 // shared integration server below.
-const serverScripts = ["scripts/test-bind.mjs", "scripts/test-permissions-e2e.mjs"];
+const serverScripts = [
+  // Was in neither this list nor `npm test`, so the only end-to-end check of
+  // the upstream-MCP bridge ran nowhere. It reaches the admin API and the
+  // proxied-tool path, which nothing else covers.
+  "scripts/test-mcp-bridge-integration.mjs",
+  "scripts/test-bind.mjs",
+  "scripts/test-permissions-e2e.mjs",
+  "scripts/test-http-access.mjs",
+  "scripts/test-mcp-stream.mjs",
+  "scripts/test-audit-http.mjs",
+];
 
 console.log("\n=== Server-level tests (self-hosted) ===");
 for (const script of serverScripts) {
@@ -101,6 +118,10 @@ const server = spawn(process.execPath, ["dist/index.js"], {
     PORT: String(mcpPort),
     ADMIN_PORT: String(adminPort),
     CHATGPT_TOOL_PROFILE: "slim",
+    // The admin API is closed by default; pinning the token here is what a
+    // caller that is not a browser does. Whether an unauthenticated request is
+    // refused is test-http-access.mjs's job, not this harness's.
+    ADMIN_TOKEN: ADMIN_TOKEN,
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -118,7 +139,11 @@ try {
   if (!admin.instructions) throw new Error("admin health missing instructions");
   console.log("OK  admin health");
 
-  const preview = await (await fetch(`http://127.0.0.1:${adminPort}/api/instructions/preview`)).json();
+  const preview = await (
+    await fetch(`http://127.0.0.1:${adminPort}/api/instructions/preview`, {
+      headers: { Authorization: `Bearer ${ADMIN_TOKEN}` },
+    })
+  ).json();
   if (!preview.preview?.includes("Agent workflow")) throw new Error("instructions preview missing agent prompt");
   console.log(`OK  instructions preview ${preview.total_chars} chars`);
 

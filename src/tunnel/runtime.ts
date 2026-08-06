@@ -226,6 +226,27 @@ export interface ConnectResult extends TunnelCommandResult {
   logTail?: string;
   /** How long the health poll took, in milliseconds. */
   waitedMs?: number;
+  /** What the runtime is unhappy about while still calling itself healthy. */
+  readinessCaveat?: string;
+}
+
+/**
+ * What `readyz` is complaining about while the runtime still reports healthy.
+ *
+ * `healthy: true` means the runtime process is up and talking to the control
+ * plane; it says nothing about whether the MCP server behind it answered. The
+ * client records that separately, in the readyz body — "ready (mcp startup
+ * probe timed out ...)". Reporting only the flag turned a runtime that had
+ * never reached the host into "Tunnel runtime is healthy.", which sent whoever
+ * ran it looking for the fault everywhere except where it was.
+ */
+export function readinessCaveat(json?: RuntimeJson): string | undefined {
+  const health = (json?.local as { effective_health?: { readyz?: { body?: string } } } | undefined)
+    ?.effective_health;
+  const body = health?.readyz?.body;
+  if (typeof body !== "string") return undefined;
+  const match = body.match(/^\s*ready\s*\((.+)\)\s*$/s);
+  return match ? match[1].trim() : undefined;
 }
 
 /**
@@ -276,5 +297,6 @@ export async function tunnelConnect(
     // reason the caller is looking.
     logTail: healthy ? undefined : await readLogTail(finalLogPath),
     waitedMs: Date.now() - started,
+    readinessCaveat: readinessCaveat(latest.json ?? connect.json),
   };
 }

@@ -38,14 +38,21 @@ async function restrictWindowsAcl(target: string): Promise<void> {
   );
 }
 
-async function writeStore(store: Record<string, string>): Promise<void> {
-  const target = secretsPath();
+/**
+ * Write a file only its owner can read.
+ *
+ * Exported because the secret store is not the only thing that has to land this
+ * way: the generated admin token is one too, and it needs somewhere to go that
+ * is not stdout. Kept as one implementation so the Windows ACL handling cannot
+ * drift between the two.
+ */
+export async function writeRestricted(target: string, content: string): Promise<void> {
   ensureDir(path.dirname(target));
 
   // Create with restrictive mode before any content is written.
   const handle = await fs.open(target, "w", 0o600);
   try {
-    await handle.writeFile(`${JSON.stringify(store, null, 2)}\n`, "utf-8");
+    await handle.writeFile(content, "utf-8");
   } finally {
     await handle.close();
   }
@@ -55,6 +62,10 @@ async function writeStore(store: Record<string, string>): Promise<void> {
   } else {
     await fs.chmod(target, 0o600);
   }
+}
+
+async function writeStore(store: Record<string, string>): Promise<void> {
+  await writeRestricted(secretsPath(), `${JSON.stringify(store, null, 2)}\n`);
 }
 
 export async function getSecret(name: string): Promise<string | undefined> {

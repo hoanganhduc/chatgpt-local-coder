@@ -206,6 +206,58 @@ try {
   ok("the engine reports honestly that approved commands are not sandboxed");
 } catch (e) { fail("shell honesty", e.message); }
 
+// --- the host's own secrets are out of reach in every profile ------------
+//
+// `read_text_file` used to return the tunnel API key to whoever asked: reads
+// were unconfined in all three profiles, and the key lives in a plain file. The
+// caller here is the connector the key authorizes, so this is the one boundary
+// no profile is allowed to widen — `open` included.
+try {
+  const fakeConfigDir = path.join(sandbox, "config-home");
+  fs.mkdirSync(path.join(fakeConfigDir, "secret-refs"), { recursive: true });
+  fs.writeFileSync(path.join(fakeConfigDir, "secrets.json"), '{"OPENAI_TUNNEL_API_KEY":"sk-live"}', "utf-8");
+  process.env.CLC_CONFIG_DIR = fakeConfigDir;
+
+  const secrets = path.join(fakeConfigDir, "secrets.json");
+  const ref = path.join(fakeConfigDir, "secret-refs", "OPENAI_TUNNEL_API_KEY");
+
+  for (const profile of ["workspace", "open", "readonly"]) {
+    setPermissionContext({ profile, roots: [workspace] });
+    for (const [label, target] of [["secrets.json", secrets], ["a secret-ref", ref]]) {
+      if (isPathAllowed(target, "read")) throw new Error(`${profile} allowed a read of ${label}`);
+      if (isPathAllowed(target, "write")) throw new Error(`${profile} allowed a write to ${label}`);
+      await denied(`${profile} read of ${label}`, () => validatePath(target, "read"));
+    }
+  }
+  ok("no profile — workspace, open or readonly — can read or write the host's own secrets");
+
+  // The whole directory, not a list of filenames: a key added later must be
+  // covered without anyone remembering to name it here.
+  setPermissionContext({ profile: "open", roots: [workspace] });
+  if (isPathAllowed(path.join(fakeConfigDir, "config.json"), "read")) {
+    throw new Error("only the known secret filenames were protected");
+  }
+  ok("the whole config directory is protected, not a list of known filenames");
+
+  let message = "";
+  try { requirePathAllowed(secrets, "read"); } catch (e) { message = e.message; }
+  if (!message.includes("config directory")) throw new Error(`denial does not explain itself: ${message}`);
+  if (message.includes("sk-live")) throw new Error("the denial quoted the secret it was refusing to show");
+  ok("the denial says why, and does not leak what it refused");
+
+  // A path merely resembling the config directory is unaffected.
+  setPermissionContext({ profile: "workspace", roots: [workspace] });
+  if (!isPathAllowed(`${fakeConfigDir}-notes.txt`, "read")) {
+    throw new Error("a sibling sharing the config directory's name prefix was blocked");
+  }
+  ok("a path sharing the config directory's name prefix is still readable");
+
+  delete process.env.CLC_CONFIG_DIR;
+} catch (e) {
+  delete process.env.CLC_CONFIG_DIR;
+  fail("secret shield", e.message);
+}
+
 // --- empty input --------------------------------------------------------
 try {
   await denied("empty path", () => validatePath("   ", "read"));
