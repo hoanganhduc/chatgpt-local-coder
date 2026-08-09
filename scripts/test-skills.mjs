@@ -409,7 +409,7 @@ await checkAsync("an unknown skill name is refused with a pointer to skill_list"
   );
 });
 
-await checkAsync("a bash skill on a simulated win32 host names Git Bash or WSL", async () => {
+await checkAsync("a bash skill uses Git Bash directly on native Windows", async () => {
   const bashDir = await writeSkill(
     execRoot,
     "bash-skill",
@@ -420,25 +420,43 @@ await checkAsync("a bash skill on a simulated win32 host names Git Bash or WSL",
   resetSkillRegistry();
   await loadSkillRegistry({ workspaceRoots: [], extraRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
 
-  // With bash present the run succeeds; the Windows-without-bash message is
-  // asserted directly against the interpreter resolver below.
+  // A native Windows host may expose the WSL launcher as System32\bash.exe
+  // before Git Bash. Skill entrypoints are native Windows paths, so the
+  // resolver must choose Git Bash directly instead of relying on PATH order.
   const result = await runSkill("bash-skill", { timeoutSec: 30 });
   assert(result.stdout.trim() === "from bash", `stdout: ${JSON.stringify(result.stdout)}`);
-
-  const savedPath = process.env.PATH;
-  process.env.PATH = path.join(tmp, "empty-path");
-  try {
-    await runSkill("bash-skill", { platform: "win32", timeoutSec: 30 }).then(
-      () => { throw new Error("should have been refused"); },
-      (e) =>
-        assert(
-          e.message === 'skill "bash-skill" requires bash; install Git Bash or run under WSL',
-          `message: ${e.message}`
-        )
-    );
-  } finally {
-    process.env.PATH = savedPath;
+  if (process.platform === "win32") {
+    const command = result.command.replaceAll("/", "\\").toLowerCase();
+    assert(command.endsWith("\\bash.exe"), `command: ${result.command}`);
+    assert(command.includes("\\git\\"), `expected Git Bash, got ${result.command}`);
+    assert(!command.includes("\\windows\\system32\\bash.exe"), `WSL launcher selected: ${result.command}`);
   }
+
+  const hidden = path.join(tmp, "no-git-bash");
+  const fakeGitRoot = path.join(hidden, "fake-git");
+  await fs.mkdir(path.join(hidden, "Git", "bin"), { recursive: true });
+  await fs.writeFile(path.join(hidden, "Git", "bin", "bash.exe"), "not an executable", "utf-8");
+  await fs.mkdir(path.join(fakeGitRoot, "cmd"), { recursive: true });
+  await fs.mkdir(path.join(fakeGitRoot, "bin"), { recursive: true });
+  await fs.writeFile(path.join(fakeGitRoot, "cmd", "git.cmd"), "@exit /b 0\r\n", "utf-8");
+  await fs.writeFile(path.join(fakeGitRoot, "cmd", "git.exe.cmd"), "@exit /b 0\r\n", "utf-8");
+  await fs.writeFile(path.join(fakeGitRoot, "bin", "bash.exe"), "not an executable", "utf-8");
+  const hiddenEnv = {
+    PATH: path.join(fakeGitRoot, "cmd"),
+    PATHEXT: ".CMD;.EXE",
+    ProgramFiles: hidden,
+    ProgramW6432: hidden,
+    "ProgramFiles(x86)": hidden,
+    LOCALAPPDATA: hidden,
+  };
+  await runSkill("bash-skill", { platform: "win32", timeoutSec: 30, env: hiddenEnv }).then(
+    () => { throw new Error("should have been refused"); },
+    (e) =>
+      assert(
+        e.message === 'skill "bash-skill" requires Git Bash; install Git for Windows',
+        `message: ${e.message}`
+      )
+  );
 });
 
 await checkAsync("skill_run reports a timeout rather than hanging", async () => {

@@ -16,6 +16,7 @@ import {
   serviceStatus,
   servicePlan,
   uninstallService,
+  type InstallResult,
   type ServiceSpec,
 } from "../../services/index.js";
 import { flag, optionalString, parseCommand, UsageError, type CommandSpec } from "../args.js";
@@ -58,6 +59,17 @@ function parsePlatform(raw: string | undefined): PlatformId | undefined {
   if (!raw) return undefined;
   if (raw === "win32" || raw === "darwin" || raw === "linux") return raw;
   throw new UsageError(`--platform expects win32, darwin, or linux, got "${raw}"`);
+}
+
+export function formatServiceOutcome(
+  sub: "install" | "uninstall",
+  result: InstallResult,
+  failed: boolean
+): string {
+  const action = sub === "install" ? "Install" : "Uninstall";
+  if (!failed) return `${action}ed ${result.plan.mechanism}: ${result.unitWritten}`;
+  const metadata = result.metadataPresent ? "metadata remains at" : "no metadata remains at";
+  return `${action} failed for ${result.plan.mechanism}; ${metadata} ${result.unitWritten}`;
 }
 
 export async function runService(argv: string[], cwd = process.cwd()): Promise<number> {
@@ -103,7 +115,7 @@ export async function runService(argv: string[], cwd = process.cwd()): Promise<n
   if (asJson) {
     console.log(JSON.stringify(result, null, 2));
   } else {
-    console.log(`${sub === "install" ? "Installed" : "Uninstalled"} ${result.plan.mechanism}: ${result.unitWritten}`);
+    console.log(formatServiceOutcome(sub as "install" | "uninstall", result, failed.length > 0));
     for (const entry of result.commandResults) {
       console.log(`  ${entry.command} -> exit ${entry.exitCode}${entry.stderr ? ` (${entry.stderr})` : ""}`);
     }

@@ -16,13 +16,22 @@ import { stateDir } from "../config/paths.js";
 import { platformId, runExecutable, type PlatformId } from "../lib/platform.js";
 import { launchdPlan } from "./launchd.js";
 import { systemdPlan } from "./systemd.js";
-import { windowsPlan } from "./windows.js";
+import { isOwnedWindowsTask, TASK_NAME, windowsPlan, windowsTaskQueryCommand } from "./windows.js";
 import type { ServicePlan, ServiceSpec, ServiceStatus } from "./types.js";
 
 export * from "./types.js";
 export { renderSystemdUnit, systemdUnitPath, systemdPlan, UNIT_NAME } from "./systemd.js";
 export { renderLaunchAgent, launchdPlistPath, launchdPlan, LABEL } from "./launchd.js";
-export { renderTaskXml, taskXmlPath, windowsPlan, TASK_NAME } from "./windows.js";
+export {
+  isOwnedWindowsTask,
+  renderTaskXml,
+  taskXmlPath,
+  windowsArgumentLine,
+  windowsPlan,
+  windowsTaskQueryCommand,
+  TASK_NAME,
+  TASK_OWNERSHIP_MARKER,
+} from "./windows.js";
 
 export function defaultLogPath(): string {
   return path.join(stateDir(), "server.log");
@@ -81,38 +90,187 @@ export interface InstallResult {
   plan: ServicePlan;
   unitWritten: string;
   commandResults: Array<{ command: string; exitCode: number | null; stderr: string }>;
+  /** Whether recoverable unit/task metadata exists after the operation. */
+  metadataPresent: boolean;
 }
 
-async function runAll(commands: ServicePlan["installCommands"]): Promise<InstallResult["commandResults"]> {
+export interface ServiceOperationOptions {
+  /** Override the per-user unit location; primarily useful for isolated tests. */
+  home?: string;
+  /** Execute service-manager commands; primarily useful for isolated tests. */
+  runner?: typeof runExecutable;
+}
+
+type CommandResult = InstallResult["commandResults"][number];
+
+async function runOne(
+  command: string,
+  args: string[],
+  runner: typeof runExecutable
+): Promise<{ summary: CommandResult; run: Awaited<ReturnType<typeof runExecutable>> }> {
+  const run = await runner(command, args, { timeoutMs: 30_000 });
+  return {
+    summary: { command: [command, ...args].join(" "), exitCode: run.exitCode, stderr: run.stderr },
+    run,
+  };
+}
+
+async function runAll(
+  commands: ServicePlan["installCommands"],
+  runner: typeof runExecutable
+): Promise<InstallResult["commandResults"]> {
   const results: InstallResult["commandResults"] = [];
   for (const [command, args] of commands) {
-    const run = await runExecutable(command, args, { timeoutMs: 30_000 });
-    results.push({ command: [command, ...args].join(" "), exitCode: run.exitCode, stderr: run.stderr });
+    const { summary } = await runOne(command, args, runner);
+    results.push(summary);
+    if (summary.exitCode !== 0) break;
   }
   return results;
 }
 
-export async function installService(spec: ServiceSpec, platform: PlatformId = platformId()): Promise<InstallResult> {
-  const plan = servicePlan(spec, platform);
+async function fileExists(file: string): Promise<boolean> {
+  try {
+    await fs.access(file);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+async function probeWindowsTask(spec: ServiceSpec, runner: typeof runExecutable): Promise<{
+  exists: boolean;
+  owned: boolean;
+  query: CommandResult;
+  blocking?: CommandResult;
+}> {
+  const [command, args] = windowsTaskQueryCommand();
+  const { summary, run } = await runOne(command, args, runner);
+  if (run.spawnFailed || run.exitCode === null || run.truncated) {
+    const blocking =
+      run.truncated && summary.exitCode === 0
+        ? {
+            ...summary,
+            exitCode: 1,
+            stderr: summary.stderr || "refusing to trust truncated Scheduled Task XML",
+          }
+        : summary;
+    return { exists: false, owned: false, query: summary, blocking };
+  }
+  if (run.exitCode !== 0) return { exists: false, owned: false, query: summary };
+  if (isOwnedWindowsTask(run.stdout, spec)) return { exists: true, owned: true, query: summary };
+  return {
+    exists: true,
+    owned: false,
+    query: summary,
+    blocking: {
+      command: summary.command,
+      exitCode: 1,
+      stderr: `refusing to modify existing unowned Scheduled Task ${JSON.stringify(TASK_NAME)}`,
+    },
+  };
+}
+
+export async function installService(
+  spec: ServiceSpec,
+  platform: PlatformId = platformId(),
+  options: ServiceOperationOptions = {}
+): Promise<InstallResult> {
+  const plan = servicePlan(spec, platform, options.home ?? os.homedir());
+  const runner = options.runner ?? runExecutable;
+  let installCommands = plan.installCommands;
+
+  if (platform === "win32") {
+    const probe = await probeWindowsTask(spec, runner);
+    if (probe.blocking) {
+      return {
+        plan,
+        unitWritten: plan.unitPath,
+        commandResults: [probe.blocking],
+        metadataPresent: await fileExists(plan.unitPath),
+      };
+    }
+    if (probe.exists && probe.owned) {
+      installCommands = plan.installCommands.map(([command, args], index): [string, string[]] =>
+        index === 0 ? [command, [...args, "/F"]] : [command, [...args]]
+      );
+    }
+  }
 
   await fs.mkdir(path.dirname(plan.unitPath), { recursive: true });
   await fs.mkdir(path.dirname(spec.logPath), { recursive: true });
+  let previous: Buffer | undefined;
+  try {
+    previous = await fs.readFile(plan.unitPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
   // The Windows task XML must be UTF-16LE with a BOM or schtasks rejects it.
   const encoding = plan.mechanism === "schtasks-logon" ? "utf16le" : "utf-8";
   const body = encoding === "utf16le" ? `﻿${plan.content}` : plan.content;
   await fs.writeFile(plan.unitPath, body, encoding);
 
-  return { plan, unitWritten: plan.unitPath, commandResults: await runAll(plan.installCommands) };
+  const commandResults = await runAll(installCommands, runner);
+  if (platform === "win32" && commandResults.some((entry) => entry.exitCode !== 0)) {
+    if (previous !== undefined) await fs.writeFile(plan.unitPath, previous);
+    else await fs.rm(plan.unitPath, { force: true });
+  }
+  return { plan, unitWritten: plan.unitPath, commandResults, metadataPresent: await fileExists(plan.unitPath) };
 }
 
 export async function uninstallService(
   spec: ServiceSpec,
-  platform: PlatformId = platformId()
+  platform: PlatformId = platformId(),
+  options: ServiceOperationOptions = {}
 ): Promise<InstallResult> {
-  const plan = servicePlan(spec, platform);
-  const commandResults = await runAll(plan.uninstallCommands);
-  await fs.rm(plan.unitPath, { force: true });
-  return { plan, unitWritten: plan.unitPath, commandResults };
+  const plan = servicePlan(spec, platform, options.home ?? os.homedir());
+  const runner = options.runner ?? runExecutable;
+
+  if (platform === "win32") {
+    const probe = await probeWindowsTask(spec, runner);
+    if (probe.blocking || !probe.exists) {
+      return {
+        plan,
+        unitWritten: plan.unitPath,
+        commandResults: [probe.blocking ?? probe.query],
+        metadataPresent: await fileExists(plan.unitPath),
+      };
+    }
+  }
+
+  const commandResults = await runAll(plan.uninstallCommands, runner);
+  if (commandResults.every((entry) => entry.exitCode === 0)) {
+    await fs.rm(plan.unitPath, { force: true });
+  }
+  return { plan, unitWritten: plan.unitPath, commandResults, metadataPresent: await fileExists(plan.unitPath) };
+}
+
+export async function stopService(
+  spec: ServiceSpec,
+  platform: PlatformId = platformId(),
+  options: ServiceOperationOptions = {}
+): Promise<InstallResult> {
+  const plan = servicePlan(spec, platform, options.home ?? os.homedir());
+  const runner = options.runner ?? runExecutable;
+
+  if (platform === "win32") {
+    const probe = await probeWindowsTask(spec, runner);
+    if (probe.blocking || !probe.exists) {
+      return {
+        plan,
+        unitWritten: plan.unitPath,
+        commandResults: [probe.blocking ?? probe.query],
+        metadataPresent: await fileExists(plan.unitPath),
+      };
+    }
+  }
+
+  return {
+    plan,
+    unitWritten: plan.unitPath,
+    commandResults: await runAll(plan.stopCommands, runner),
+    metadataPresent: await fileExists(plan.unitPath),
+  };
 }
 
 export async function serviceStatus(

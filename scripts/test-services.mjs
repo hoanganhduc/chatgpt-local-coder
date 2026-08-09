@@ -13,17 +13,24 @@ import path from "path";
 
 import {
   LABEL,
+  isOwnedWindowsTask,
+  installService,
   launchdPlistPath,
   renderLaunchAgent,
   renderSystemdUnit,
   renderTaskXml,
   servicePlan,
+  stopService,
   systemdUnitPath,
   TASK_NAME,
+  TASK_OWNERSHIP_MARKER,
   taskXmlPath,
   UNIT_NAME,
+  uninstallService,
   rotateServerLog,
+  windowsTaskQueryCommand,
 } from "../dist/services/index.js";
+import { runExecutable } from "../dist/lib/platform.js";
 
 let passed = 0;
 let failed = 0;
@@ -38,6 +45,42 @@ async function checkAsync(name, fn) {
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 function includes(haystack, needle, what) {
   assert(haystack.includes(needle), `${what}: missing ${JSON.stringify(needle)}`);
+}
+function xmlDecode(value) {
+  return value
+    .replaceAll("&quot;", '"')
+    .replaceAll("&apos;", "'")
+    .replaceAll("&gt;", ">")
+    .replaceAll("&lt;", "<")
+    .replaceAll("&amp;", "&");
+}
+function xmlEncode(value) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+function taskAction(task) {
+  const command = /<Command>([\s\S]*?)<\/Command>/.exec(task)?.[1] ?? "";
+  const args = /<Arguments>([\s\S]*?)<\/Arguments>/.exec(task)?.[1] ?? "";
+  return { command: xmlDecode(command), args: xmlDecode(args) };
+}
+function decodedTaskScript(task) {
+  const { args } = taskAction(task);
+  const encoded = /(?:^|\s)-EncodedCommand\s+([A-Za-z0-9+/=]+)$/.exec(args)?.[1];
+  assert(encoded, `missing EncodedCommand: ${args}`);
+  return Buffer.from(encoded, "base64").toString("utf16le");
+}
+function taskPayload(task) {
+  const script = decodedTaskScript(task);
+  const encoded = /FromBase64String\('([A-Za-z0-9+/=]+)'\)/.exec(script)?.[1];
+  assert(encoded, `missing encoded payload: ${script}`);
+  return JSON.parse(Buffer.from(encoded, "base64").toString("utf-8"));
+}
+function commandRun({ exitCode = 0, stdout = "", stderr = "", spawnFailed = false, truncated = false } = {}) {
+  return { exitCode, stdout, stderr, spawnFailed, truncated, timedOut: false };
 }
 
 const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-services-"));
@@ -73,7 +116,8 @@ check("the systemd unit is a user unit at the documented path", () => {
 
 check("the systemd unit carries absolute paths, the environment, and the log", () => {
   const unit = renderSystemdUnit(spec);
-  includes(unit, `ExecStart=${NODE} ${ENTRY} up --no-tunnel`, "ExecStart");
+  const quote = (value) => value.includes(" ") ? `"${value}"` : value;
+  includes(unit, `ExecStart=${quote(NODE)} ${quote(ENTRY)} up --no-tunnel`, "ExecStart");
   includes(unit, `WorkingDirectory=${WORKDIR}`, "WorkingDirectory");
   includes(unit, `Environment="CLC_CONFIG_DIR=${path.join(tmp, "config")}"`, "config dir");
   includes(unit, `Environment="NODE_ENV=production"`, "node env");
@@ -163,26 +207,112 @@ check("the Windows task is a logon task at the documented path", () => {
   assert(plan.unitPath === taskXmlPath(home), "the plan and the helper must agree");
 });
 
-check("the task XML runs the absolute exec path with the environment prefix", () => {
+check("the task XML uses an absolute encoded PowerShell launcher", () => {
   const task = renderTaskXml(spec);
   includes(task, '<?xml version="1.0" encoding="UTF-16"?>', "schtasks requires the UTF-16 declaration");
-  includes(task, "<Command>cmd.exe</Command>", "the command is the shell wrapper");
   includes(task, `<WorkingDirectory>${WORKDIR}</WorkingDirectory>`, "working directory");
   includes(task, "<LogonTrigger>", "logon trigger");
   includes(task, "<RunLevel>LeastPrivilege</RunLevel>", "no elevation");
+  includes(task, TASK_OWNERSHIP_MARKER, "stable task ownership marker");
 
-  const args = /<Arguments>([\s\S]*?)<\/Arguments>/.exec(task)?.[1];
-  assert(args?.startsWith("/c set CLC_CONFIG_DIR="), `arguments start: ${args?.slice(0, 40)}`);
-  includes(args, "set NODE_ENV=production", "second variable");
-  includes(args, `&quot;${NODE}&quot;`, "the exec path is quoted");
-  includes(args, "up --no-tunnel", "the remaining argv");
+  const { command, args } = taskAction(task);
+  assert(path.win32.isAbsolute(command), `PowerShell path is not absolute: ${command}`);
+  assert(command.toLowerCase().endsWith("\\windowspowershell\\v1.0\\powershell.exe"), `command: ${command}`);
+  assert(/^-NoLogo -NoProfile -NonInteractive -EncodedCommand [A-Za-z0-9+/=]+$/.test(args), `arguments: ${args}`);
+  const payload = taskPayload(task);
+  assert(payload.execPath === NODE, `exec path: ${payload.execPath}`);
+  assert(typeof payload.argumentLine === "string" && payload.argumentLine.includes("--no-tunnel"), `arguments: ${payload.argumentLine}`);
+  assert(payload.workingDirectory === WORKDIR, `working directory: ${payload.workingDirectory}`);
+  assert(JSON.stringify(payload.env) === JSON.stringify(spec.env), `environment: ${JSON.stringify(payload.env)}`);
 });
 
-check("the task XML escapes the && separator exactly once", () => {
-  const args = /<Arguments>([\s\S]*?)<\/Arguments>/.exec(renderTaskXml(spec))?.[1] ?? "";
-  includes(args, "&amp;&amp;", "the separator must be a single XML escape");
-  assert(!args.includes("&amp;amp;"), `double-escaped: ${args}`);
-  assert(!/&&/.test(args.replace(/&amp;/g, "")), "no raw ampersand may survive");
+check("the task keeps environment values and argv out of the PowerShell command text", () => {
+  const hostile = {
+    ...spec,
+    args: [String.raw`C:\safe&pipe|redirect<in>out^caret(100%)!bang"quote\main.js`, "up"],
+    env: { CLC_CONFIG_DIR: String.raw`C:\config&pipe|redirect<in>out^caret(100%)!bang"quote`, NODE_ENV: "production" },
+  };
+  const task = renderTaskXml(hostile);
+  const { args } = taskAction(task);
+  const script = decodedTaskScript(task);
+  for (const value of [hostile.execPath, ...hostile.args, ...Object.values(hostile.env)]) {
+    assert(!args.includes(value), `raw value reached task arguments: ${JSON.stringify(value)}`);
+    assert(!script.includes(value), `raw value reached PowerShell script: ${JSON.stringify(value)}`);
+  }
+  const payload = taskPayload(task);
+  assert(payload.execPath === hostile.execPath, `exec path: ${payload.execPath}`);
+  assert(payload.workingDirectory === hostile.workingDirectory, `working directory: ${payload.workingDirectory}`);
+  assert(JSON.stringify(payload.env) === JSON.stringify(hostile.env), `environment: ${JSON.stringify(payload.env)}`);
+});
+
+check("Windows task ownership requires an exact structured action", () => {
+  const owned = renderTaskXml(spec);
+  assert(isOwnedWindowsTask(owned, spec), "current marker-bearing task was not recognized");
+  const forgedAction = owned.replace(/<Command>[\s\S]*?<\/Command>/, "<Command>C:\\attacker\\payload.exe</Command>");
+  assert(!isOwnedWindowsTask(forgedAction, spec), "marker alone accepted a forged action");
+  const scattered = `<Task><Description>other</Description><Command>other.exe</Command><Arguments>${TASK_OWNERSHIP_MARKER} ${xmlEncode(NODE)} --no-tunnel</Arguments><WorkingDirectory>${xmlEncode(WORKDIR)}</WorkingDirectory></Task>`;
+  assert(!isOwnedWindowsTask(scattered, spec), "scattered ownership substrings were accepted");
+
+  const legacyEnv = Object.entries(spec.env).map(([key, value]) => `set ${key}=${value}&& `).join("");
+  const legacyArgs = spec.args.map((part) => part.includes(" ") ? `"${part}"` : part).join(" ");
+  const legacy = `<Task><RegistrationInfo><Description>${xmlEncode(spec.description)}</Description></RegistrationInfo><Actions><Exec><Command>cmd.exe</Command><Arguments>${xmlEncode(`/c ${legacyEnv}"${spec.execPath}" ${legacyArgs}`)}</Arguments><WorkingDirectory>${xmlEncode(spec.workingDirectory)}</WorkingDirectory></Exec></Actions></Task>`;
+  assert(isOwnedWindowsTask(legacy, spec), "exact legacy task was not recognized for migration");
+});
+
+await checkAsync("the encoded Windows launcher preserves metacharacters without executing them", async () => {
+  if (process.platform !== "win32") return;
+  const probe = path.join(tmp, "task-probe.mjs");
+  await fs.writeFile(
+    probe,
+    'process.stdout.write(JSON.stringify({ env: process.env.CLC_TASK_PROBE, args: process.argv.slice(2) }));\n',
+    "utf-8"
+  );
+  const expected = {
+    env: String.raw`env&pipe|redirect<in>out^caret(100%)!bang"quote`,
+    args: [
+      "",
+      'a"b',
+      "two words",
+      "space and trailing slash\\",
+      String.raw`x\" y`,
+      String.raw`arg&pipe|redirect<in>out^caret(100%)!bang"quote`,
+    ],
+  };
+  const task = renderTaskXml({
+    ...spec,
+    execPath: process.execPath,
+    args: [probe, ...expected.args],
+    workingDirectory: tmp,
+    env: { CLC_TASK_PROBE: expected.env },
+  });
+  const { command, args } = taskAction(task);
+  assert(/powershell\.exe$/i.test(command), `unsafe launcher selected: ${command}`);
+  const result = await runExecutable(command, args.split(/\s+/), { cwd: tmp, timeoutMs: 30_000 });
+  assert(result.exitCode === 0, `exit ${result.exitCode}: ${result.stderr}`);
+  assert(JSON.stringify(JSON.parse(result.stdout)) === JSON.stringify(expected), `stdout: ${result.stdout}`);
+});
+
+await checkAsync("the encoded Windows launcher reports a missing executable as failure", async () => {
+  if (process.platform !== "win32") return;
+  const missing = path.join(tmp, "missing", "definitely-not-an-executable.exe");
+  const task = renderTaskXml({ ...spec, execPath: missing, args: [], env: {} });
+  const { command, args } = taskAction(task);
+  const result = await runExecutable(command, args.split(/\s+/), { cwd: tmp, timeoutMs: 30_000 });
+  assert(result.exitCode !== 0, `missing executable reported exit ${result.exitCode}: ${result.stdout}`);
+});
+
+check("the encoded Windows launcher refuses relative and batch executables", () => {
+  for (const execPath of [
+    "node.exe",
+    String.raw`C:\tools\launch.cmd`,
+    String.raw`C:\tools\launch.bat`,
+    String.raw`C:\tools\launch.cmd. .`,
+    String.raw`C:\tools\launch.cmd::$DATA`,
+  ]) {
+    let message = "";
+    try { renderTaskXml({ ...spec, execPath }); } catch (error) { message = error.message; }
+    assert(/absolute native executable/i.test(message), `${execPath}: ${message}`);
+  }
 });
 
 check("the Windows plan says plainly that it is not a service", () => {
@@ -194,9 +324,17 @@ check("the Windows plan says plainly that it is not a service", () => {
   assert(plan.notes.some((n) => /elevation/i.test(n)), "the reason should be stated");
 
   const [command, args] = plan.installCommands[0];
-  assert(command === "schtasks", `unexpected command: ${command}`);
+  assert(path.win32.isAbsolute(command) && command.toLowerCase().endsWith("\\system32\\schtasks.exe"), `unexpected command: ${command}`);
   assert(args.includes("/XML") && args[args.indexOf("/XML") + 1] === plan.unitPath, "the XML path must match");
-  assert(args.includes("/F"), "install should overwrite an existing task");
+  assert(!args.includes("/F"), "the static plan must not overwrite an unverified task");
+});
+
+check("native Windows system tools ignore environment-controlled Windows roots", () => {
+  if (process.platform !== "win32") return;
+  const fakeRoot = path.join(tmp, "attacker-controlled-windows");
+  const [command] = windowsTaskQueryCommand({ SystemRoot: fakeRoot, windir: fakeRoot });
+  assert(!command.toLowerCase().startsWith(fakeRoot.toLowerCase()), `environment selected ${command}`);
+  assert(command.toLowerCase().endsWith("\\system32\\schtasks.exe"), `unexpected command: ${command}`);
 });
 
 // -------------------------------------------------------------- all three
@@ -208,8 +346,14 @@ check("every platform yields absolute paths and a distinct mechanism", () => {
     mechanisms.add(plan.mechanism);
     assert(path.isAbsolute(plan.unitPath), `${platform}: unit path is not absolute`);
     assert(plan.content.length > 200, `${platform}: content looks empty`);
-    assert(plan.content.includes(NODE), `${platform}: the executable is missing from the unit`);
-    assert(plan.content.includes(ENTRY), `${platform}: the entry point is missing from the unit`);
+    if (platform === "win32") {
+      const payload = taskPayload(plan.content);
+      assert(payload.execPath === NODE, `${platform}: the executable is missing from the payload`);
+      assert(payload.argumentLine.includes("main.js"), `${platform}: the entry point is missing from the payload`);
+    } else {
+      assert(plan.content.includes(NODE), `${platform}: the executable is missing from the unit`);
+      assert(plan.content.includes(ENTRY), `${platform}: the entry point is missing from the unit`);
+    }
     assert(plan.installCommands.length >= 1, `${platform}: no install command`);
     assert(plan.uninstallCommands.length >= 1, `${platform}: no uninstall command`);
     assert(plan.stopCommands.length >= 1, `${platform}: no stop command`);
@@ -220,7 +364,8 @@ check("every platform yields absolute paths and a distinct mechanism", () => {
 check("no plan mentions the tunnel: that lifecycle belongs to tunnel-client", () => {
   for (const platform of ["linux", "darwin", "win32"]) {
     const plan = servicePlan(spec, platform, home);
-    assert(plan.content.includes("--no-tunnel"), `${platform}: the unit should start the server without a tunnel`);
+    const launchContent = platform === "win32" ? taskPayload(plan.content).argumentLine : plan.content;
+    assert(launchContent.includes("--no-tunnel"), `${platform}: the unit should start the server without a tunnel`);
     const commands = [...plan.installCommands, ...plan.uninstallCommands, ...plan.stopCommands]
       .map(([c, a]) => `${c} ${a.join(" ")}`)
       .join("\n");
@@ -246,6 +391,182 @@ await checkAsync("generating a plan writes nothing to disk", async () => {
     homeExists = false;
   }
   assert(!homeExists, "the fake home directory should never have been created");
+});
+
+await checkAsync("a failed service install restores existing metadata", async () => {
+  const fakeHome = path.join(tmp, "failed-install-home");
+  const unit = taskXmlPath(fakeHome);
+  await fs.mkdir(path.dirname(unit), { recursive: true });
+  await fs.writeFile(unit, "previous task metadata", "utf-8");
+  const runner = async (_command, args) =>
+    args.includes("/Query")
+      ? commandRun({ exitCode: 1, stderr: "task not found" })
+      : commandRun({ exitCode: 1, stderr: "create failed" });
+  const result = await installService(
+    { ...spec, logPath: path.join(tmp, "failed-install.log") },
+    "win32",
+    { home: fakeHome, runner }
+  );
+  assert(result.commandResults.some((entry) => entry.exitCode !== 0), "the create command should fail");
+  assert(result.metadataPresent === true, "restored metadata should be reported present");
+  assert((await fs.readFile(unit, "utf-8")) === "previous task metadata", "failed install replaced recoverable metadata");
+});
+
+await checkAsync("a failed first service install removes newly written metadata", async () => {
+  const fakeHome = path.join(tmp, "failed-first-install-home");
+  const unit = taskXmlPath(fakeHome);
+  const runner = async (_command, args) =>
+    args.includes("/Query")
+      ? commandRun({ exitCode: 1, stderr: "task not found" })
+      : commandRun({ exitCode: 1, stderr: "create failed" });
+  const result = await installService(
+    { ...spec, logPath: path.join(tmp, "failed-first-install.log") },
+    "win32",
+    { home: fakeHome, runner }
+  );
+  assert(result.commandResults.some((entry) => entry.exitCode !== 0), "the create command should fail");
+  assert(result.metadataPresent === false, "removed first-install metadata should be reported absent");
+  await fs.access(unit).then(
+    () => { throw new Error("failed install left new metadata behind"); },
+    () => undefined
+  );
+});
+
+await checkAsync("a failed service uninstall preserves metadata for retry", async () => {
+  const fakeHome = path.join(tmp, "failed-uninstall-home");
+  const unit = taskXmlPath(fakeHome);
+  await fs.mkdir(path.dirname(unit), { recursive: true });
+  await fs.writeFile(unit, "task metadata for retry", "utf-8");
+  const runner = async (_command, args) =>
+    args.includes("/Query")
+      ? commandRun({ stdout: renderTaskXml(spec) })
+      : commandRun({ exitCode: 1, stderr: "delete failed" });
+  const result = await uninstallService(
+    { ...spec, logPath: path.join(tmp, "failed-uninstall.log") },
+    "win32",
+    { home: fakeHome, runner }
+  );
+  assert(result.commandResults.some((entry) => entry.exitCode !== 0), "the delete command should fail");
+  assert(result.metadataPresent === true, "retry metadata should be reported present");
+  assert((await fs.readFile(unit, "utf-8")) === "task metadata for retry", "failed uninstall removed retry metadata");
+});
+
+await checkAsync("a colliding unowned Windows task is never overwritten, stopped, or deleted", async () => {
+  for (const operation of ["install", "stop", "uninstall"]) {
+    const fakeHome = path.join(tmp, `collision-${operation}-home`);
+    const unit = taskXmlPath(fakeHome);
+    await fs.mkdir(path.dirname(unit), { recursive: true });
+    await fs.writeFile(unit, "our previous metadata", "utf-8");
+    let calls = 0;
+    const runner = async () => {
+      calls++;
+      return commandRun({ stdout: "<Task><Description>someone else's task</Description></Task>" });
+    };
+    const result = operation === "install"
+      ? await installService(spec, "win32", { home: fakeHome, runner })
+      : operation === "stop"
+        ? await stopService(spec, "win32", { home: fakeHome, runner })
+        : await uninstallService(spec, "win32", { home: fakeHome, runner });
+    assert(calls === 1, `${operation} ran a mutating command after the ownership probe`);
+    assert(result.commandResults[0]?.exitCode !== 0, `${operation} accepted an unowned collision`);
+    assert(result.metadataPresent === true, `${operation} lost local recovery metadata`);
+    assert((await fs.readFile(unit, "utf-8")) === "our previous metadata", `${operation} changed metadata`);
+  }
+});
+
+await checkAsync("a verified owned Windows task may be replaced and uninstalled", async () => {
+  const fakeHome = path.join(tmp, "owned-task-home");
+  const unit = taskXmlPath(fakeHome);
+  await fs.mkdir(path.dirname(unit), { recursive: true });
+  await fs.writeFile(unit, "old owned metadata", "utf-8");
+  let createArgs;
+  const installRunner = async (_command, args) => {
+    if (args.includes("/Query")) return commandRun({ stdout: renderTaskXml(spec) });
+    createArgs = args;
+    return commandRun();
+  };
+  const installed = await installService(spec, "win32", { home: fakeHome, runner: installRunner });
+  assert(installed.commandResults.every((entry) => entry.exitCode === 0), "owned task update failed");
+  assert(createArgs?.includes("/F"), "verified owned task update did not enable replacement");
+  assert(installed.metadataPresent === true, "installed metadata should be present");
+
+  let ended = false;
+  const stopRunner = async (_command, args) => {
+    if (args.includes("/Query")) return commandRun({ stdout: renderTaskXml(spec) });
+    ended = args.includes("/End");
+    return commandRun();
+  };
+  const stopped = await stopService(spec, "win32", { home: fakeHome, runner: stopRunner });
+  assert(ended && stopped.commandResults.every((entry) => entry.exitCode === 0), "verified owned task was not stopped");
+
+  let deleted = false;
+  const uninstallRunner = async (_command, args) => {
+    if (args.includes("/Query")) return commandRun({ stdout: renderTaskXml(spec) });
+    deleted = args.includes("/Delete");
+    return commandRun();
+  };
+  const uninstalled = await uninstallService(spec, "win32", { home: fakeHome, runner: uninstallRunner });
+  assert(deleted, "verified owned task was not deleted");
+  assert(uninstalled.metadataPresent === false, "successful uninstall left metadata behind");
+});
+
+await checkAsync("a first Windows install cannot overwrite a task when the ownership query misses", async () => {
+  const fakeHome = path.join(tmp, "clean-install-home");
+  let createArgs;
+  const runner = async (_command, args) => {
+    if (args.includes("/Query")) return commandRun({ exitCode: 1, stderr: "task not found" });
+    createArgs = args;
+    return commandRun();
+  };
+  const result = await installService(spec, "win32", { home: fakeHome, runner });
+  assert(result.commandResults.every((entry) => entry.exitCode === 0), "clean install failed");
+  assert(!createArgs?.includes("/F"), "unverified install enabled overwrite");
+});
+
+await checkAsync("a truncated Windows ownership query blocks with a non-zero result", async () => {
+  const fakeHome = path.join(tmp, "truncated-query-home");
+  let calls = 0;
+  const runner = async () => {
+    calls++;
+    return commandRun({ stdout: renderTaskXml(spec), truncated: true });
+  };
+  const result = await installService(spec, "win32", { home: fakeHome, runner });
+  assert(calls === 1, `ran ${calls} commands after a truncated query`);
+  assert(result.commandResults[0]?.exitCode !== 0, "truncated ownership output reported success");
+  assert(result.metadataPresent === false, "blocked operation wrote metadata");
+});
+
+await checkAsync("service command sequences stop after their first failure", async () => {
+  const fakeHome = path.join(tmp, "stop-after-failure-home");
+  let calls = 0;
+  const runner = async () => {
+    calls++;
+    return commandRun({ exitCode: 1, stderr: "first command failed" });
+  };
+  const result = await installService(spec, "linux", { home: fakeHome, runner });
+  assert(calls === 1, `ran ${calls} commands after the first failure`);
+  assert(result.commandResults.length === 1, `recorded ${result.commandResults.length} commands`);
+});
+
+await checkAsync("multi-step install failures keep the definition the manager may have loaded", async () => {
+  for (const platform of ["linux", "darwin"]) {
+    const fakeHome = path.join(tmp, `${platform}-second-command-home`);
+    const unit = platform === "linux" ? systemdUnitPath(fakeHome) : launchdPlistPath(fakeHome);
+    await fs.mkdir(path.dirname(unit), { recursive: true });
+    await fs.writeFile(unit, "previous definition", "utf-8");
+    let calls = 0;
+    const runner = async () => {
+      calls++;
+      return calls === 1 ? commandRun() : commandRun({ exitCode: 1, stderr: "second command failed" });
+    };
+    const result = await installService(spec, platform, { home: fakeHome, runner });
+    assert(calls === 2, `${platform}: expected two calls, got ${calls}`);
+    assert(result.commandResults[1]?.exitCode !== 0, `${platform}: second failure missing`);
+    assert(result.metadataPresent === true, `${platform}: retry definition is absent`);
+    const current = await fs.readFile(unit, "utf-8");
+    assert(current !== "previous definition", `${platform}: restored metadata that may no longer match manager state`);
+    assert(current === result.plan.content, `${platform}: retry metadata differs from the attempted definition`);
+  }
 });
 
 // ------------------------------------------------------------ log rotation

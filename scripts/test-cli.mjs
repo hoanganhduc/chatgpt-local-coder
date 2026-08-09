@@ -14,6 +14,8 @@ import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 
+import { formatServiceOutcome } from "../dist/cli/commands/service.js";
+
 let passed = 0;
 let failed = 0;
 function ok(m) { console.log(`OK  ${m}`); passed++; }
@@ -22,6 +24,14 @@ async function checkAsync(name, fn) {
   try { await fn(); ok(name); } catch (e) { fail(name, e.message || e); }
 }
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
+function taskLaunchText(content) {
+  const encodedCommand = /-EncodedCommand\s+([A-Za-z0-9+/=]+)/.exec(content)?.[1];
+  assert(encodedCommand, "Windows task is missing EncodedCommand");
+  const script = Buffer.from(encodedCommand, "base64").toString("utf16le");
+  const encodedPayload = /FromBase64String\('([A-Za-z0-9+/=]+)'\)/.exec(script)?.[1];
+  assert(encodedPayload, "Windows task is missing its encoded launch payload");
+  return Buffer.from(encodedPayload, "base64").toString("utf-8");
+}
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(repoRoot, "dist", "cli", "main.js");
@@ -355,6 +365,20 @@ await checkAsync("status --json describes a host that is not running", async () 
 
 // ------------------------------------------------------------------ service
 
+await checkAsync("service failure text reports whether recovery metadata remains", async () => {
+  const result = {
+    plan: { mechanism: "schtasks-logon" },
+    unitWritten: String.raw`C:\state\ChatGPTLocalCoder.xml`,
+    commandResults: [{ command: "schtasks", exitCode: 1, stderr: "failed" }],
+    metadataPresent: true,
+  };
+  const retained = formatServiceOutcome("uninstall", result, true);
+  assert(/Uninstall failed/.test(retained) && /metadata remains at/.test(retained), retained);
+  const absent = formatServiceOutcome("install", { ...result, metadataPresent: false }, true);
+  assert(/Install failed/.test(absent) && /no metadata remains at/.test(absent), absent);
+  assert(!/Installed/.test(absent), `failed operation reported success: ${absent}`);
+});
+
 await checkAsync("service --dry-run prints a unit without installing anything", async () => {
   for (const platform of ["linux", "darwin", "win32"]) {
     const result = await run(["service", "install", "--dry-run", "--platform", platform, "--json"]);
@@ -362,8 +386,9 @@ await checkAsync("service --dry-run prints a unit without installing anything", 
 
     const plan = JSON.parse(result.stdout);
     assert(path.isAbsolute(plan.unitPath), `${platform}: unit path is not absolute`);
-    assert(plan.content.includes("--no-tunnel"), `${platform}: the unit should not manage the tunnel`);
-    assert(plan.content.includes("up"), `${platform}: the unit should run \`up\``);
+    const launch = platform === "win32" ? taskLaunchText(plan.content) : plan.content;
+    assert(launch.includes("--no-tunnel"), `${platform}: the unit should not manage the tunnel`);
+    assert(launch.includes("up"), `${platform}: the unit should run \`up\``);
     assert(plan.installCommands.length >= 1, `${platform}: no install command`);
 
     let created = true;

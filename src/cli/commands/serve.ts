@@ -203,12 +203,11 @@ export async function runDown(argv: string[], cwd = process.cwd()): Promise<numb
     return failures ? 1 : 0;
   }
 
-  const { servicePlan } = await import("../../services/index.js");
-  const { runExecutable } = await import("../../lib/platform.js");
-  for (const [command, args] of servicePlan(spec).stopCommands) {
-    const run = await runExecutable(command, args, { timeoutMs: 30_000 });
-    if (run.exitCode !== 0) {
-      console.error(`${command} ${args.join(" ")} exited ${run.exitCode}: ${run.stderr}`);
+  const { stopService } = await import("../../services/index.js");
+  const stopped = await stopService(spec);
+  for (const result of stopped.commandResults) {
+    if (result.exitCode !== 0) {
+      console.error(`${result.command} exited ${result.exitCode}: ${result.stderr}`);
       failures++;
     }
   }

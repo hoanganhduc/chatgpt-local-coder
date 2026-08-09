@@ -17,6 +17,7 @@ import {
   detachedSpawnOptions,
   runExecutable,
   windowsBatchInvocation,
+  windowsSystemTool,
   homeDir,
 } from "../dist/lib/platform.js";
 
@@ -494,8 +495,8 @@ try {
   if (built.argv0 !== `"${built.command}"`) throw new Error(`argv0 unquoted: ${built.argv0}`);
   const switches = built.args.slice(0, 5).join(" ");
   if (switches !== "/d /e:on /v:off /s /c") throw new Error(`switches: ${switches}`);
-  const kept = windowsBatchInvocation("x.cmd", [], { ComSpec: "C:\\Windows\\SysWOW64\\CMD.EXE" });
-  if (kept.command !== "C:\\Windows\\SysWOW64\\CMD.EXE") throw new Error(`a real cmd.exe was replaced: ${kept.command}`);
+  const kept = windowsBatchInvocation("x.cmd", [], { ComSpec: "C:\\evil\\cmd.exe", SystemRoot: "C:\\Windows" });
+  if (kept.command !== windowsSystemTool("cmd.exe", WIN_ENV)) throw new Error(`ComSpec selected: ${kept.command}`);
   ok("windowsBatchInvocation only ever runs a real cmd.exe");
 } catch (e) { fail("windowsBatchInvocation ComSpec", e.message); }
 

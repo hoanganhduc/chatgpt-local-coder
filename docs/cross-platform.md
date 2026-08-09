@@ -80,13 +80,13 @@ needs — `node`, `python`, `bash`, `powershell` — and gets that interpreter;
 script `sh` can run.
 
 Only `node` is guaranteed: it is the interpreter already running the host. The
-rest are looked up on `PATH`, and what is normally there differs:
+others are resolved as follows:
 
 | Runtime | Resolved as | Windows |
 |---|---|---|
 | `node` | this host's own `process.execPath` | always available |
 | `python` | `python3` then `python` on POSIX, `python` then `python3` on Windows | not shipped — install Python, and note the App Execution Alias stub that opens the Store is not an interpreter |
-| `bash` | `bash` | not shipped — Git Bash puts one on `PATH` |
+| `bash` | `bash` on POSIX; Git Bash's canonical absolute path on Windows | not shipped — install Git for Windows; the host derives Git Bash from the Git for Windows registry entry or a real `git.exe` on `PATH` without changing `PATH`, accepting a batch shim, or selecting the WSL launcher |
 | `powershell` | `pwsh`, falling back to `powershell` on Windows only | always available |
 
 A missing interpreter is reported as a failed run naming what to install, not as
@@ -203,8 +203,8 @@ create.
 
 Windows has no process groups to signal, so `killProcessTree` walks the tree with
 `taskkill /T /F` where POSIX sends a signal to the negative pid. `taskkill.exe`
-and `cmd.exe` are resolved to an absolute path under `%SystemRoot%\System32`
-(`systemTool` in `src/lib/platform.ts`) and never launched by bare name: libuv
+and `cmd.exe` are resolved through the kernel's `SystemRoot` link to their
+canonical absolute paths (`windowsSystemTool` in `src/lib/platform.ts`) and never launched by bare name: libuv
 resolves a Windows child from `PATH` alone and does not fall back to the System32
 lookup `CreateProcess` performs on its own. Spawned by name under a narrowed
 `PATH` the kill fails with `ENOENT`, and because the failure was discarded the
@@ -214,18 +214,19 @@ outlives its timeout with nothing left to stop it. POSIX never showed this,
 anyway the host falls back to terminating the process itself, which does not
 reach its children but is not nothing.
 
-Those two are the tools spawned on a hot path, where a narrowed `PATH` is
-plausible and the failure would be silent. Three others are still spawned by
-bare name, and it is worth knowing which and why:
+System helpers used for process cleanup and Task Scheduler management are
+resolved through `\\?\GLOBALROOT\SystemRoot\System32`, then canonicalized before
+execution. Mutable `SystemRoot`, `windir`, and `PATH` values cannot substitute
+those binaries. Two helpers
+are still spawned by bare name, and it is worth knowing which and why:
 
 | Tool | Spawned by | Consequence if `PATH` cannot find it |
 |---|---|---|
 | `icacls` | the secret store, to restrict the DACL | the file keeps the ACL it inherited from `%APPDATA%` — the one case here where a lost lookup weakens a guarantee rather than failing loudly |
-| `schtasks` | `service install`/`uninstall`/`stop` | the command reports a non-zero exit and the failing command line |
 | `powershell` | shell selection, only when `pwsh` is absent | `run_command` fails to start its shell |
 
-`schtasks` and `powershell` are run from an interactive command with the
-operator's own environment, and both fail visibly. `icacls` does not, so on a
+The shell fallback runs from an interactive command with the operator's own
+environment and fails visibly. `icacls` does not, so on a
 machine where other accounts can read your `%APPDATA%`, keep credentials in the
 environment rather than the store — the same advice `docs/credentials.md` gives
 for the write-then-restrict window.
@@ -351,6 +352,21 @@ which of the three you are on.
 The Windows XML is written UTF-16LE with a BOM — `schtasks /Create /XML` rejects
 anything else — and it is the input to the task, not the task itself. Deleting
 it does not uninstall anything; `service uninstall` runs `schtasks /Delete`.
+The task launches the absolute Windows PowerShell 5.1 executable with an encoded
+data payload, then starts Node through `ProcessStartInfo` with shell execution
+disabled. Paths, arguments and process-local environment values are never
+interpolated into PowerShell or CMD source. A failed install restores the prior
+XML (or removes a newly created one), and a failed uninstall keeps the XML so
+the operation can be retried. On systemd and launchd, a later command failure
+keeps the attempted definition because the manager may already have loaded it;
+that preserves a matching retry artifact. Command sequences stop on their first
+failure.
+
+Before replacing, stopping, or deleting the fixed-name task, the host queries
+its XML and checks a stable ownership marker. A first install omits `schtasks /F`, so a task
+that appeared after the query still cannot be overwritten. Definitions written
+by older releases are recognized once by their exact description, executable,
+and `--no-tunnel` action, then upgraded to the marker-bearing form.
 
 ### Previewing another platform's unit
 

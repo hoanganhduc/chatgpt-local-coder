@@ -3,7 +3,7 @@
  * Everything else in the codebase should be OS-agnostic.
  */
 
-import { execFile, spawn } from "child_process";
+import { execFile, execFileSync, spawn } from "child_process";
 import fs from "fs";
 import os from "os";
 import path from "path";
@@ -57,7 +57,7 @@ export function pathsAreCaseInsensitive(): boolean {
  * PATHEXT is only ever appended, so "node.exe" is looked up as "node.exe" and
  * not as "node.exe.exe".
  */
-function windowsCandidates(binary: string): string[] {
+function windowsCandidates(binary: string, env: NodeJS.ProcessEnv = process.env): string[] {
   const parseExts = (raw: string): string[] =>
     raw
       .split(";")
@@ -65,19 +65,19 @@ function windowsCandidates(binary: string): string[] {
       .filter(Boolean)
       .map((ext) => (ext.startsWith(".") ? ext : `.${ext}`));
 
-  const fromEnv = parseExts(process.env.PATHEXT || "");
+  const fromEnv = parseExts(env.PATHEXT || "");
   const exts = fromEnv.length ? fromEnv : parseExts(".EXE;.CMD;.BAT");
   const appended = exts.map((ext) => binary + ext);
 
   return exts.includes(path.extname(binary).toLowerCase()) ? [binary, ...appended] : appended;
 }
 
-function onPath(binary: string): string | undefined {
-  const dirs = (process.env.PATH || "").split(path.delimiter).filter(Boolean);
+function onPath(binary: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  const dirs = (env.PATH || "").split(path.delimiter).filter(Boolean);
   // fs.constants.X_OK "has no effect on Windows (will behave like
   // fs.constants.F_OK)", so on Windows it is the extension list, not the access
   // check, that decides whether a match is executable.
-  const candidates = isWindows() ? windowsCandidates(binary) : [binary];
+  const candidates = isWindows() ? windowsCandidates(binary, env) : [binary];
 
   for (const dir of dirs) {
     for (const candidate of candidates) {
@@ -94,8 +94,85 @@ function onPath(binary: string): string | undefined {
 }
 
 /** Look up an executable on PATH; returns the absolute path or undefined. */
-export function which(binary: string): string | undefined {
-  return onPath(binary);
+export function which(binary: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
+  return onPath(binary, env);
+}
+
+/**
+ * Find Git Bash on native Windows without accepting System32\bash.exe, which
+ * is the WSL launcher and cannot execute a native `C:\...` skill entrypoint.
+ *
+ * Git for Windows normally exposes `git.exe` from `<root>\cmd` while keeping
+ * Bash in `<root>\bin`. Installer registry metadata covers ordinary installs;
+ * the real git.exe path covers portable installs. PATH itself is not changed.
+ */
+export function gitBashPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (!isWindows()) return undefined;
+
+  const candidates: string[] = [];
+  const addRoot = (root: string | undefined) => {
+    if (!root) return;
+    candidates.push(path.win32.join(root, "bin", "bash.exe"));
+    candidates.push(path.win32.join(root, "usr", "bin", "bash.exe"));
+  };
+
+  // Git for Windows records its install root. Query it with the canonical
+  // system reg.exe so mutable ProgramFiles-style variables cannot substitute a
+  // Bash binary. A caller supplying an isolated environment intentionally gets
+  // isolated discovery and skips the host registry.
+  if (env === process.env) {
+    let reg: string | undefined;
+    try {
+      reg = windowsSystemTool("reg.exe");
+    } catch {
+      /* PATH discovery below can still find portable Git */
+    }
+    if (reg) {
+      for (const [key, view] of [
+        ["HKLM\\SOFTWARE\\GitForWindows", "/reg:64"],
+        ["HKLM\\SOFTWARE\\GitForWindows", "/reg:32"],
+        ["HKCU\\SOFTWARE\\GitForWindows", ""],
+      ]) {
+        try {
+          const args = ["query", key, "/v", "InstallPath", ...(view ? [view] : [])];
+          const output = execFileSync(reg, args, {
+            encoding: "utf8",
+            windowsHide: true,
+            stdio: ["ignore", "pipe", "ignore"],
+          });
+          addRoot(/^\s*InstallPath\s+REG_\S+\s+(.+?)\s*$/im.exec(output)?.[1]);
+        } catch {
+          /* this registry view has no Git installation */
+        }
+      }
+    }
+  }
+
+  // Ask specifically for git.exe: accepting a git.cmd shim would let a batch
+  // alias select an unrelated sibling bash.exe.
+  const locatedGit = which("git.exe", env);
+  const git = locatedGit && path.win32.basename(locatedGit).toLowerCase() === "git.exe" ? locatedGit : undefined;
+  if (git) {
+    const parent = path.win32.dirname(git);
+    const parentName = path.win32.basename(parent).toLowerCase();
+    if (parentName === "cmd" || parentName === "bin") addRoot(path.win32.dirname(parent));
+  }
+
+  const seen = new Set<string>();
+  for (const candidate of candidates) {
+    const key = path.win32.normalize(candidate).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    try {
+      const resolved = fs.realpathSync.native(candidate);
+      if (!fs.statSync(resolved).isFile()) continue;
+      if (path.win32.basename(resolved).toLowerCase() !== "bash.exe") continue;
+      return resolved;
+    } catch {
+      /* keep looking */
+    }
+  }
+  return undefined;
 }
 
 function posixShellArgs(script: string): string[] {
@@ -235,7 +312,7 @@ export async function killProcessTree(pid: number, mode: KillMode = "escalate"):
     // has, and a caller that narrowed PATH would otherwise get a silent ENOENT
     // here and a child that outlives its timeout.
     const failed = await new Promise<boolean>((resolve) => {
-      execFile(systemTool("taskkill.exe", process.env), ["/PID", String(pid), "/T", "/F"], (error) =>
+      execFile(windowsSystemTool("taskkill.exe"), ["/PID", String(pid), "/T", "/F"], (error) =>
         resolve(Boolean(error))
       );
     });
@@ -307,7 +384,7 @@ export interface RunResult {
  * suffix when it resolves a path, so `claude.cmd. .` and `claude.cmd::$DATA`
  * name the same file as `claude.cmd` and all three have to count as one.
  */
-function isBatchTarget(command: string): boolean {
+export function isWindowsBatchTarget(command: string): boolean {
   const name = command.split(/[\\/]/).pop() ?? "";
   const stem = name.replace(/^[A-Za-z]:/, "").split(":")[0] ?? "";
   const ext = /\.([a-zA-Z0-9]+)[\s.]*$/.exec(stem)?.[1]?.toLowerCase();
@@ -367,16 +444,27 @@ const MAX_BATCH_COMMAND_LINE = 8000;
  * PATH alone — it does not fall back to the System32 lookup CreateProcess does
  * on its own — so a caller that narrows PATH makes the spawn fail with ENOENT.
  */
-function systemTool(name: string, env: NodeJS.ProcessEnv): string {
+export function windowsSystemTool(name: string, env: NodeJS.ProcessEnv = process.env): string {
+  if (isWindows()) {
+    // GLOBALROOT reaches the kernel's SystemRoot link without trusting mutable
+    // SystemRoot/windir environment variables. Resolve it before spawning:
+    // CreateProcess does not accept the GLOBALROOT alias itself as argv[0].
+    const globalRoot = path.win32.join("\\\\?\\GLOBALROOT\\SystemRoot\\System32", name);
+    const resolved = fs.realpathSync.native(globalRoot);
+    if (!fs.statSync(resolved).isFile()) {
+      throw new Error(`Windows system tool is not a regular file: ${resolved}`);
+    }
+    return resolved;
+  }
+  // Cross-platform dry runs still need a representable Windows plan. This path
+  // is rendered only; a non-Windows host never executes it.
   return path.win32.join(env.SystemRoot || env.windir || "C:\\Windows", "System32", name);
 }
 
-/** Which cmd.exe to run. Only a real cmd.exe understands the switches and the
- * `%%cd:~,%` escape below, so a `ComSpec` naming anything else is ignored. */
+/** Which cmd.exe to run. Batch quoting depends on the stock parser and switches,
+ * so an environment-controlled ComSpec is never an executable selector. */
 function comSpec(env: NodeJS.ProcessEnv): string {
-  const configured = (env.ComSpec || env.COMSPEC || "").trim();
-  if (configured && path.win32.basename(configured).toLowerCase() === "cmd.exe") return configured;
-  return systemTool("cmd.exe", env);
+  return windowsSystemTool("cmd.exe", env);
 }
 
 export interface BatchInvocation {
@@ -406,7 +494,7 @@ export function windowsBatchInvocation(
   args: string[],
   env: NodeJS.ProcessEnv = process.env
 ): BatchInvocation | null {
-  if (!isBatchTarget(command)) return null;
+  if (!isWindowsBatchTarget(command)) return null;
 
   const tokens = [command, ...args];
   const unrepresentable = tokens.find((token) => BATCH_UNREPRESENTABLE.test(token));

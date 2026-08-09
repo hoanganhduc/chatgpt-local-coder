@@ -13,7 +13,7 @@
 
 import fs from "fs/promises";
 import path from "path";
-import { isWindows, platformId, runExecutable, which, type RunResult } from "../lib/platform.js";
+import { gitBashPath, isWindows, platformId, runExecutable, which, type RunResult } from "../lib/platform.js";
 import { requireCommandAllowed } from "../lib/permissions.js";
 import { findSkill, skillSupportsPlatform } from "./registry.js";
 import type { DiscoveredSkill } from "./discover.js";
@@ -29,6 +29,8 @@ export interface SkillRunOptions {
   allowExecution?: boolean;
   /** Overrides the detected platform; used by tests. */
   platform?: string;
+  /** Overrides interpreter discovery and the child environment; used by tests. */
+  env?: NodeJS.ProcessEnv;
 }
 
 export interface SkillRunResult {
@@ -54,7 +56,8 @@ export function isSkillRuntime(value: string | undefined): value is SkillRuntime
 function resolveInterpreter(
   runtime: SkillRuntime,
   skillName: string,
-  platform: string
+  platform: string,
+  env: NodeJS.ProcessEnv
 ): { command: string; leadingArgs: string[] } | { error: string } {
   switch (runtime) {
     case "node":
@@ -64,7 +67,7 @@ function resolveInterpreter(
       // Windows ships `python`; most Linux/macOS installs expose `python3`.
       const candidates = platform === "win32" ? ["python", "python3"] : ["python3", "python"];
       for (const candidate of candidates) {
-        const found = which(candidate);
+        const found = which(candidate, env);
         if (found) return { command: found, leadingArgs: [] };
       }
       return {
@@ -73,16 +76,18 @@ function resolveInterpreter(
     }
 
     case "bash": {
-      const found = which("bash");
-      if (found) return { command: found, leadingArgs: [] };
       if (platform === "win32") {
-        return { error: `skill "${skillName}" requires bash; install Git Bash or run under WSL` };
+        const found = gitBashPath(env);
+        if (found) return { command: found, leadingArgs: [] };
+        return { error: `skill "${skillName}" requires Git Bash; install Git for Windows` };
       }
+      const found = which("bash", env);
+      if (found) return { command: found, leadingArgs: [] };
       return { error: `skill "${skillName}" requires bash; install bash and ensure it is on PATH` };
     }
 
     case "powershell": {
-      const found = which("pwsh") || (platform === "win32" ? which("powershell") : undefined);
+      const found = which("pwsh", env) || (platform === "win32" ? which("powershell", env) : undefined);
       if (found) {
         return { command: found, leadingArgs: ["-NoProfile", "-NonInteractive", "-File"] };
       }
@@ -164,7 +169,8 @@ export async function runSkill(
   }
 
   const entrypoint = await resolveEntrypoint(skill);
-  const interpreter = resolveInterpreter(runtime, skill.name, platform);
+  const env = opts.env ?? process.env;
+  const interpreter = resolveInterpreter(runtime, skill.name, platform, env);
   if ("error" in interpreter) throw new Error(interpreter.error);
 
   const args = [...interpreter.leadingArgs, entrypoint, ...(opts.args ?? [])];
@@ -173,7 +179,7 @@ export async function runSkill(
   const result: RunResult = await runExecutable(interpreter.command, args, {
     cwd: opts.cwd ?? skill.dir,
     timeoutMs,
-    env: { ...process.env, SKILL_DIR: skill.dir, SKILL_NAME: skill.name },
+    env: { ...env, SKILL_DIR: skill.dir, SKILL_NAME: skill.name },
   });
 
   return {
@@ -194,7 +200,7 @@ export function availableRuntimes(): Record<SkillRuntime, boolean> {
   return {
     node: true,
     python: Boolean(which("python3") || which("python")),
-    bash: Boolean(which("bash")),
+    bash: isWindows() ? Boolean(gitBashPath()) : Boolean(which("bash")),
     powershell: Boolean(which("pwsh") || (isWindows() && which("powershell"))),
     none: false,
   };
