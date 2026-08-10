@@ -8,6 +8,7 @@
  * process.
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
@@ -16,7 +17,18 @@ import { stateDir } from "../config/paths.js";
 import { platformId, runExecutable, type PlatformId } from "../lib/platform.js";
 import { launchdPlan } from "./launchd.js";
 import { systemdPlan } from "./systemd.js";
-import { isOwnedWindowsTask, TASK_NAME, windowsPlan, windowsTaskQueryCommand } from "./windows.js";
+import {
+  isOwnedWindowsTask,
+  TASK_NAME,
+  windowsLauncherCompileCommand,
+  windowsLauncherExecutablePath,
+  windowsLauncherSourcePath,
+  windowsLauncherSupportDirectory,
+  windowsPlan,
+  windowsTaskLauncherExecutablePath,
+  windowsTaskQueryCommand,
+} from "./windows.js";
+import { WINDOWS_LAUNCHER_SOURCE } from "./windows-launcher.js";
 import type { ServicePlan, ServiceSpec, ServiceStatus } from "./types.js";
 
 export * from "./types.js";
@@ -24,14 +36,25 @@ export { renderSystemdUnit, systemdUnitPath, systemdPlan, UNIT_NAME } from "./sy
 export { renderLaunchAgent, launchdPlistPath, launchdPlan, LABEL } from "./launchd.js";
 export {
   isOwnedWindowsTask,
+  renderWindowsPowerShellPredecessorTaskXml,
   renderTaskXml,
   taskXmlPath,
+  windowsLauncherCompileCommand,
+  windowsLauncherExecutablePath,
+  windowsLauncherSourcePath,
+  windowsLauncherSupportDirectory,
   windowsArgumentLine,
   windowsPlan,
+  windowsTaskLauncherExecutablePath,
   windowsTaskQueryCommand,
   TASK_NAME,
   TASK_OWNERSHIP_MARKER,
 } from "./windows.js";
+export {
+  WINDOWS_LAUNCHER_BASENAME,
+  WINDOWS_LAUNCHER_SOURCE,
+  WINDOWS_LAUNCHER_SOURCE_SHA256,
+} from "./windows-launcher.js";
 
 export function defaultLogPath(): string {
   return path.join(stateDir(), "server.log");
@@ -138,11 +161,13 @@ async function fileExists(file: string): Promise<boolean> {
   }
 }
 
-async function probeWindowsTask(spec: ServiceSpec, runner: typeof runExecutable): Promise<{
+async function probeWindowsTask(spec: ServiceSpec, runner: typeof runExecutable, home: string): Promise<{
   exists: boolean;
   owned: boolean;
   query: CommandResult;
   blocking?: CommandResult;
+  taskXml?: string;
+  launcherPath?: string;
 }> {
   const [command, args] = windowsTaskQueryCommand();
   const { summary, run } = await runOne(command, args, runner);
@@ -158,7 +183,25 @@ async function probeWindowsTask(spec: ServiceSpec, runner: typeof runExecutable)
     return { exists: false, owned: false, query: summary, blocking };
   }
   if (run.exitCode !== 0) return { exists: false, owned: false, query: summary };
-  if (isOwnedWindowsTask(run.stdout, spec)) return { exists: true, owned: true, query: summary };
+  const launcherPath = windowsTaskLauncherExecutablePath(run.stdout, spec, home);
+  if (launcherPath) {
+    try {
+      await assertSafeSupportParents(launcherPath);
+      await validatePublishedGuiExecutable(launcherPath);
+      return { exists: true, owned: true, query: summary, taskXml: run.stdout, launcherPath };
+    } catch (error) {
+      return {
+        exists: true,
+        owned: false,
+        query: summary,
+        taskXml: run.stdout,
+        blocking: operationFailure(summary.command, error),
+      };
+    }
+  }
+  if (isOwnedWindowsTask(run.stdout, spec, home)) {
+    return { exists: true, owned: true, query: summary, taskXml: run.stdout };
+  }
   return {
     exists: true,
     owned: false,
@@ -171,31 +214,306 @@ async function probeWindowsTask(spec: ServiceSpec, runner: typeof runExecutable)
   };
 }
 
+interface FileSnapshot {
+  path: string;
+  previous?: Buffer;
+}
+
+async function snapshotFile(file: string): Promise<FileSnapshot> {
+  try {
+    return { path: file, previous: await fs.readFile(file) };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { path: file };
+    throw error;
+  }
+}
+
+async function restoreFiles(snapshots: FileSnapshot[]): Promise<void> {
+  for (const snapshot of snapshots) {
+    if (snapshot.previous === undefined) {
+      await fs.rm(snapshot.path, { force: true });
+    } else {
+      await fs.mkdir(path.dirname(snapshot.path), { recursive: true });
+      await fs.writeFile(snapshot.path, snapshot.previous);
+    }
+  }
+}
+
+async function assertSafeSupportParents(file: string): Promise<void> {
+  const parent = path.resolve(path.dirname(file));
+  const root = path.parse(parent).root;
+  const components = path.relative(root, parent).split(path.sep).filter(Boolean);
+  let current = root;
+  for (const component of ["", ...components]) {
+    if (component) current = path.join(current, component);
+    try {
+      const stat = await fs.lstat(current);
+      if (stat.isSymbolicLink()) {
+        throw new Error(`refusing launcher support path with reparse-point parent ${JSON.stringify(current)}`);
+      }
+      if (!stat.isDirectory()) {
+        throw new Error(`refusing launcher support path with non-directory parent ${JSON.stringify(current)}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
+    }
+  }
+}
+
+async function writeContentAddressedSource(file: string, content: string): Promise<void> {
+  try {
+    const stat = await fs.lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`refusing unsafe launcher source ${JSON.stringify(file)}`);
+    if ((await fs.readFile(file, "utf8")) !== content) {
+      throw new Error(`content-addressed launcher source mismatch at ${JSON.stringify(file)}`);
+    }
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+
+  await fs.mkdir(path.dirname(file), { recursive: true });
+  const temporary = `${file}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(temporary, content, { encoding: "utf8", flag: "wx" });
+  try {
+    try {
+      await fs.link(temporary, file);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if ((await fs.readFile(file, "utf8")) !== content) {
+        throw new Error(`content-addressed launcher source collision at ${JSON.stringify(file)}`);
+      }
+    }
+  } finally {
+    await fs.rm(temporary, { force: true });
+  }
+}
+
+async function readValidatedGuiExecutable(file: string): Promise<Buffer | undefined> {
+  try {
+    const stat = await fs.lstat(file);
+    if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`refusing unsafe native launcher ${JSON.stringify(file)}`);
+    const bytes = await fs.readFile(file);
+    if (bytes.length < 128 || bytes.readUInt16LE(0) !== 0x5a4d) throw new Error("native launcher is not a PE image");
+    const peOffset = bytes.readUInt32LE(0x3c);
+    if (peOffset + 96 > bytes.length || bytes.readUInt32LE(peOffset) !== 0x00004550) {
+      throw new Error("native launcher has an invalid PE header");
+    }
+    const optionalHeader = peOffset + 24;
+    const magic = bytes.readUInt16LE(optionalHeader);
+    if ((magic !== 0x10b && magic !== 0x20b) || bytes.readUInt16LE(optionalHeader + 68) !== 2) {
+      throw new Error("native launcher is not a Windows GUI executable");
+    }
+    return bytes;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function validatePublishedGuiExecutable(file: string): Promise<Buffer> {
+  const expectedDigest = /^ChatGPTLocalCoderLauncher-([a-f0-9]{64})\.exe$/i.exec(path.basename(file))?.[1]?.toLowerCase();
+  if (!expectedDigest) throw new Error(`native launcher path is not content-addressed: ${JSON.stringify(file)}`);
+  const bytes = await readValidatedGuiExecutable(file);
+  if (!bytes) throw new Error(`native launcher is missing: ${JSON.stringify(file)}`);
+  const actualDigest = createHash("sha256").update(bytes).digest("hex");
+  if (actualDigest !== expectedDigest) {
+    throw new Error(`native launcher digest mismatch at ${JSON.stringify(file)}`);
+  }
+  return bytes;
+}
+
+async function publishWindowsLauncher(
+  temporaryPath: string,
+  home: string
+): Promise<{ executablePath: string; created: boolean }> {
+  const freshBytes = await readValidatedGuiExecutable(temporaryPath);
+  if (!freshBytes) throw new Error("native launcher compiler reported success without an output file");
+  const digest = createHash("sha256").update(freshBytes).digest("hex");
+  const executablePath = windowsLauncherExecutablePath(home, digest);
+  await assertSafeSupportParents(executablePath);
+  try {
+    await fs.link(temporaryPath, executablePath);
+    return { executablePath, created: true };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const existingBytes = await validatePublishedGuiExecutable(executablePath);
+    if (!existingBytes.equals(freshBytes)) {
+      throw new Error(`native launcher SHA-256 collision at ${JSON.stringify(executablePath)}`);
+    }
+    return { executablePath, created: false };
+  }
+}
+
+function operationFailure(command: string, error: unknown): CommandResult {
+  return {
+    command,
+    exitCode: 1,
+    stderr: error instanceof Error ? error.message : String(error),
+  };
+}
+
+async function installWindowsService(
+  spec: ServiceSpec,
+  plan: ServicePlan,
+  home: string,
+  runner: typeof runExecutable
+): Promise<InstallResult> {
+  const initial = await probeWindowsTask(spec, runner, home);
+  if (initial.blocking) {
+    return {
+      plan,
+      unitWritten: plan.unitPath,
+      commandResults: [initial.blocking],
+      metadataPresent: await fileExists(plan.unitPath),
+    };
+  }
+
+  const sourcePath = windowsLauncherSourcePath(home);
+  const supportDirectory = windowsLauncherSupportDirectory(home);
+  const temporaryExecutablePath = path.join(
+    supportDirectory,
+    `.ChatGPTLocalCoderLauncher-${randomUUID()}.tmp.exe`
+  );
+  const commandResults: CommandResult[] = [];
+  try {
+    await assertSafeSupportParents(sourcePath);
+    await assertSafeSupportParents(temporaryExecutablePath);
+  } catch (error) {
+    commandResults.push(operationFailure("prepare native Windows launcher", error));
+    return { plan, unitWritten: plan.unitPath, commandResults, metadataPresent: await fileExists(plan.unitPath) };
+  }
+  const unitSnapshot = await snapshotFile(plan.unitPath);
+  const sourceExisted = await fileExists(sourcePath);
+  let installedPlan = plan;
+  let publishedExecutablePath: string | undefined;
+  let publishedExecutableCreated = false;
+  const rollback = async (): Promise<void> => {
+    await restoreFiles([unitSnapshot]);
+    await assertSafeSupportParents(sourcePath);
+    await assertSafeSupportParents(temporaryExecutablePath);
+    if (!sourceExisted) await fs.rm(sourcePath, { force: true });
+    await fs.rm(temporaryExecutablePath, { force: true });
+    if (publishedExecutableCreated && publishedExecutablePath) {
+      await assertSafeSupportParents(publishedExecutablePath);
+      await fs.rm(publishedExecutablePath, { force: true });
+    }
+  };
+  try {
+    await fs.mkdir(path.dirname(plan.unitPath), { recursive: true });
+    await fs.mkdir(path.dirname(spec.logPath), { recursive: true });
+    await fs.mkdir(supportDirectory, { recursive: true });
+    await assertSafeSupportParents(sourcePath);
+    await assertSafeSupportParents(temporaryExecutablePath);
+    await writeContentAddressedSource(sourcePath, WINDOWS_LAUNCHER_SOURCE);
+
+    await assertSafeSupportParents(sourcePath);
+    await assertSafeSupportParents(temporaryExecutablePath);
+    const [compileCommand, compileArgs] = windowsLauncherCompileCommand(sourcePath, temporaryExecutablePath);
+    const compiled = await runOne(compileCommand, compileArgs, runner);
+    commandResults.push(compiled.summary);
+    if (compiled.summary.exitCode !== 0) {
+      await rollback();
+      return { plan, unitWritten: plan.unitPath, commandResults, metadataPresent: await fileExists(plan.unitPath) };
+    }
+
+    const published = await publishWindowsLauncher(temporaryExecutablePath, home);
+    publishedExecutablePath = published.executablePath;
+    publishedExecutableCreated = published.created;
+    await fs.rm(temporaryExecutablePath, { force: true });
+    installedPlan = windowsPlan(spec, home, process.env, publishedExecutablePath);
+    await fs.writeFile(installedPlan.unitPath, `﻿${installedPlan.content}`, "utf16le");
+
+    // Re-query after staging/compilation and immediately before the only task
+    // mutation. A same-name task appearing, disappearing, or changing ownership
+    // during preparation makes the install fail closed.
+    const current = await probeWindowsTask(spec, runner, home);
+    if (
+      current.blocking ||
+      current.exists !== initial.exists ||
+      current.owned !== initial.owned ||
+      current.taskXml !== initial.taskXml
+    ) {
+      commandResults.push(
+        current.blocking ?? operationFailure(current.query.command, new Error("Scheduled Task changed during install preparation"))
+      );
+      await rollback();
+      return {
+        plan: installedPlan,
+        unitWritten: installedPlan.unitPath,
+        commandResults,
+        metadataPresent: await fileExists(installedPlan.unitPath),
+      };
+    }
+
+    const [createCommand, createArgs] = installedPlan.installCommands[0];
+    const create = await runOne(
+      createCommand,
+      current.exists && current.owned ? [...createArgs, "/F"] : createArgs,
+      runner
+    );
+    const afterCreate = await probeWindowsTask(spec, runner, home);
+    const intendedInstalled =
+      afterCreate.exists &&
+      afterCreate.owned &&
+      afterCreate.launcherPath?.toLowerCase() === publishedExecutablePath.toLowerCase();
+    if (intendedInstalled) {
+      commandResults.push(
+        create.summary.exitCode === 0
+          ? create.summary
+          : {
+              ...create.summary,
+              exitCode: 0,
+              stderr: [create.summary.stderr, "task creation was confirmed by a post-create ownership query"]
+                .filter(Boolean)
+                .join("; "),
+            }
+      );
+    } else {
+      const initialTaskConfirmedUnchanged =
+        initial.exists &&
+        afterCreate.exists &&
+        !afterCreate.blocking &&
+        afterCreate.owned === initial.owned &&
+        afterCreate.taskXml === initial.taskXml;
+      if (initialTaskConfirmedUnchanged) await rollback();
+      commandResults.push(
+        create.summary.exitCode !== 0
+          ? create.summary
+          : operationFailure(
+              create.summary.command,
+              new Error("task creation returned success but the intended Scheduled Task could not be verified")
+            )
+      );
+    }
+    return {
+      plan: installedPlan,
+      unitWritten: installedPlan.unitPath,
+      commandResults,
+      metadataPresent: await fileExists(installedPlan.unitPath),
+    };
+  } catch (error) {
+    commandResults.push(operationFailure("prepare native Windows launcher", error));
+    await rollback();
+    return {
+      plan: installedPlan,
+      unitWritten: installedPlan.unitPath,
+      commandResults,
+      metadataPresent: await fileExists(installedPlan.unitPath),
+    };
+  }
+}
+
 export async function installService(
   spec: ServiceSpec,
   platform: PlatformId = platformId(),
   options: ServiceOperationOptions = {}
 ): Promise<InstallResult> {
-  const plan = servicePlan(spec, platform, options.home ?? os.homedir());
+  const home = options.home ?? os.homedir();
+  const plan = servicePlan(spec, platform, home);
   const runner = options.runner ?? runExecutable;
-  let installCommands = plan.installCommands;
-
-  if (platform === "win32") {
-    const probe = await probeWindowsTask(spec, runner);
-    if (probe.blocking) {
-      return {
-        plan,
-        unitWritten: plan.unitPath,
-        commandResults: [probe.blocking],
-        metadataPresent: await fileExists(plan.unitPath),
-      };
-    }
-    if (probe.exists && probe.owned) {
-      installCommands = plan.installCommands.map(([command, args], index): [string, string[]] =>
-        index === 0 ? [command, [...args, "/F"]] : [command, [...args]]
-      );
-    }
-  }
+  if (platform === "win32") return installWindowsService(spec, plan, home, runner);
 
   await fs.mkdir(path.dirname(plan.unitPath), { recursive: true });
   await fs.mkdir(path.dirname(spec.logPath), { recursive: true });
@@ -210,11 +528,7 @@ export async function installService(
   const body = encoding === "utf16le" ? `﻿${plan.content}` : plan.content;
   await fs.writeFile(plan.unitPath, body, encoding);
 
-  const commandResults = await runAll(installCommands, runner);
-  if (platform === "win32" && commandResults.some((entry) => entry.exitCode !== 0)) {
-    if (previous !== undefined) await fs.writeFile(plan.unitPath, previous);
-    else await fs.rm(plan.unitPath, { force: true });
-  }
+  const commandResults = await runAll(plan.installCommands, runner);
   return { plan, unitWritten: plan.unitPath, commandResults, metadataPresent: await fileExists(plan.unitPath) };
 }
 
@@ -223,11 +537,12 @@ export async function uninstallService(
   platform: PlatformId = platformId(),
   options: ServiceOperationOptions = {}
 ): Promise<InstallResult> {
-  const plan = servicePlan(spec, platform, options.home ?? os.homedir());
+  const home = options.home ?? os.homedir();
+  const plan = servicePlan(spec, platform, home);
   const runner = options.runner ?? runExecutable;
 
   if (platform === "win32") {
-    const probe = await probeWindowsTask(spec, runner);
+    const probe = await probeWindowsTask(spec, runner, home);
     if (probe.blocking || !probe.exists) {
       return {
         plan,
@@ -240,7 +555,15 @@ export async function uninstallService(
 
   const commandResults = await runAll(plan.uninstallCommands, runner);
   if (commandResults.every((entry) => entry.exitCode === 0)) {
-    await fs.rm(plan.unitPath, { force: true });
+    if (platform === "win32") {
+      // schtasks reports absence, access denial, and RPC failures through the
+      // same localized non-zero channel. Remove only the retry XML here and
+      // retain inert, content-addressed launcher support rather than risk
+      // deleting a binary that Task Scheduler may still reference.
+      await fs.rm(plan.unitPath, { force: true });
+    } else {
+      await fs.rm(plan.unitPath, { force: true });
+    }
   }
   return { plan, unitWritten: plan.unitPath, commandResults, metadataPresent: await fileExists(plan.unitPath) };
 }
@@ -250,11 +573,12 @@ export async function stopService(
   platform: PlatformId = platformId(),
   options: ServiceOperationOptions = {}
 ): Promise<InstallResult> {
-  const plan = servicePlan(spec, platform, options.home ?? os.homedir());
+  const home = options.home ?? os.homedir();
+  const plan = servicePlan(spec, platform, home);
   const runner = options.runner ?? runExecutable;
 
   if (platform === "win32") {
-    const probe = await probeWindowsTask(spec, runner);
+    const probe = await probeWindowsTask(spec, runner, home);
     if (probe.blocking || !probe.exists) {
       return {
         plan,

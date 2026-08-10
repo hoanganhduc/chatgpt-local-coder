@@ -51,7 +51,7 @@ export function defaultServiceSpec(cwd = process.cwd()): ServiceSpec {
     workingDirectory: config.workspaceRoots[0] ?? cwd,
     description: "chatgpt-local-coder MCP host",
     logPath: path.join(stateDir(), "server.log"),
-    env: { CLC_CONFIG_DIR: path.dirname(configFilePath()), NODE_ENV: "production" },
+    env: { CLC_CONFIG_DIR: path.dirname(configFilePath()), NODE_ENV: "production", CLC_SERVICE_MODE: "1" },
   };
 }
 
@@ -103,7 +103,11 @@ export async function runService(argv: string[], cwd = process.cwd()): Promise<n
     } else {
       console.log(`# ${plan.mechanism} — would write ${plan.unitPath}`);
       console.log(plan.content);
-      console.log(`# then run: ${plan.installCommands.map(([c, a]) => `${c} ${a.join(" ")}`).join("; ")}`);
+      if (plan.mechanism === "schtasks-logon") {
+        console.log("# install compiles and publishes the native GUI launcher before registering this template");
+      } else {
+        console.log(`# then run: ${plan.installCommands.map(([c, a]) => `${c} ${a.join(" ")}`).join("; ")}`);
+      }
       for (const note of plan.notes) console.log(`# note: ${note}`);
     }
     return 0;

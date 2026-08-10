@@ -65,7 +65,7 @@ const adminPort = port + 1;
 
 // --- default: no browser origin is allowed anywhere ----------------------
 {
-  const server = startServer({ PORT: String(port), ADMIN_PORT: String(adminPort) });
+  const server = startServer({ PORT: String(port), ADMIN_PORT: String(adminPort), CLC_SERVICE_MODE: "1" });
   try {
     await waitForHealth(`http://127.0.0.1:${port}/health`);
 
@@ -150,8 +150,8 @@ const adminPort = port + 1;
     }
     ok("the admin UI does not hand its token to an unauthenticated caller");
 
-    // A generated token is a secret and stdout is not private: run as a service,
-    // the banner goes to the journal. Off a terminal the URL has to reach the
+    // A generated token is a secret and stdout is not private: this process is
+    // explicitly marked as a managed service, whose banner goes to a log. The URL has to reach the
     // operator some other way, and the token must not be in the log at all.
     const urlFile = path.join(sandbox, "state", "admin-url");
     if (!fs.existsSync(urlFile)) {

@@ -44,8 +44,9 @@ export function adminUrlFile(): string {
  * A generated token is a secret, and stdout is not private: run under systemd or
  * launchd, the banner goes to the journal, which is retained and readable by
  * more than the person who started the process. So the URL is printed only to an
- * attached terminal — the operator who ran it and is looking at it. Otherwise it
- * goes to a file only its owner can read, and the banner names the path.
+ * attached interactive terminal — the operator who ran it and is looking at
+ * it. Managed service mode always uses the restricted file even if stdout is
+ * unexpectedly attached; other non-TTY starts use the same safe handoff.
  *
  * A configured token is never printed either way; the bare `/ui` is enough,
  * because whoever set ADMIN_TOKEN already has it.
@@ -53,7 +54,7 @@ export function adminUrlFile(): string {
 export function announceAdminUrl(host: string, port: number): string {
   const url = adminUiUrl(host, port);
   if (!adminTokenIsGenerated()) return url;
-  if (process.stdout.isTTY) return url;
+  if (process.env.CLC_SERVICE_MODE !== "1" && process.stdout.isTTY) return url;
 
   const target = adminUrlFile();
   void writeRestricted(target, `${url}\n`).catch(() => undefined);

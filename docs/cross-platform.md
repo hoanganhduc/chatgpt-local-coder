@@ -344,7 +344,7 @@ in the foreground.
 |---|---|---|---|
 | Linux | systemd **user** unit `chatgpt-local-coder.service` | `~/.config/systemd/user/` | Needs a user session bus. Survives logout only when lingering is enabled (`loginctl enable-linger $USER`). |
 | macOS | LaunchAgent `com.chatgpt-local-coder` | `~/Library/LaunchAgents/com.chatgpt-local-coder.plist` | Starts at login. Installed with `launchctl bootstrap gui/<uid>`, which replaces the deprecated `load`; on macOS older than 10.11 use `launchctl load -w <plist>` by hand. |
-| Windows | `schtasks` logon task `ChatGPTLocalCoder` | `%LOCALAPPDATA%\chatgpt-local-coder\ChatGPTLocalCoder.xml` | Starts at logon. No service-account install, so nothing runs before you log in. |
+| Windows | `schtasks` logon task `ChatGPTLocalCoder` | `%LOCALAPPDATA%\chatgpt-local-coder\ChatGPTLocalCoder.xml` plus versioned launcher support under `service\` | Starts at logon. No service-account install, so nothing runs before you log in. |
 
 `service status` reports the mechanism and the path, so you never have to guess
 which of the three you are on.
@@ -352,21 +352,42 @@ which of the three you are on.
 The Windows XML is written UTF-16LE with a BOM — `schtasks /Create /XML` rejects
 anything else — and it is the input to the task, not the task itself. Deleting
 it does not uninstall anything; `service uninstall` runs `schtasks /Delete`.
-The task launches the absolute Windows PowerShell 5.1 executable with an encoded
-data payload, then starts Node through `ProcessStartInfo` with shell execution
-disabled. Paths, arguments and process-local environment values are never
-interpolated into PowerShell or CMD source. A failed install restores the prior
-XML (or removes a newly created one), and a failed uninstall keeps the XML so
-the operation can be retried. On systemd and launchd, a later command failure
-keeps the attempted definition because the manager may already have loaded it;
-that preserves a matching retry artifact. Command sequences stop on their first
-failure.
+At install time only, absolute Windows PowerShell 5.1 compiles the exact
+content-addressed C# source to a unique temporary Windows GUI executable. The
+installer validates the PE subsystem, hashes the compiled bytes, and publishes
+them without replacement as `ChatGPTLocalCoderLauncher-<sha256>.exe`. A
+same-name file is accepted only when its bytes exactly match that fresh build.
+The registered task invokes the resulting hash-named executable directly —
+never PowerShell, CMD, WScript, or Node at the Task Scheduler boundary. Its
+opaque structured payload carries the Node path, quoted argv, working directory,
+log path, and environment overrides as data. The launcher calls
+`CreateProcessW` for Node with `CREATE_NO_WINDOW`, creates it suspended, assigns
+it to a kill-on-close job, redirects output to the service log, resumes it,
+waits, and reports its exit code.
+
+A failed install rolls back only when a post-create query proves the previous
+task is unchanged. If task creation committed but its command reported an error,
+the matching registered definition wins; indeterminate results retain the new
+XML and launcher so a possibly committed task is never left pointing at a
+deleted file. A prior potentially-running executable is never rewritten or
+deleted during install. Immediately before `/Create`, the installer queries the
+task a second time and requires the exact same owned definition it observed
+before staging. Windows uninstall removes the owned task and retry XML but
+retains inert, content-addressed launcher support: localized `schtasks` failures
+cannot reliably prove absence, so automatic binary cleanup could break a task
+that still exists. A failed uninstall keeps the XML and support files so the
+operation can be retried. On systemd and launchd, a later command failure keeps
+the attempted definition because the manager may already have loaded it.
+Command sequences stop on their first failure.
 
 Before replacing, stopping, or deleting the fixed-name task, the host queries
-its XML and checks a stable ownership marker. A first install omits `schtasks /F`, so a task
-that appeared after the query still cannot be overwritten. Definitions written
-by older releases are recognized once by their exact description, executable,
-and `--no-tunnel` action, then upgraded to the marker-bearing form.
+its XML and checks the action, principal, run level, visibility, working
+directory, and ownership description. A first install omits `schtasks /F`, so a
+task that appeared after the query still cannot be overwritten. Exact historical
+PowerShell schema-v1 definitions — including the installed `-WindowStyle Hidden`
+attempt — are allowlisted for one migration; pre-marker CMD tasks lack a
+verifiable principal/trigger envelope and must be removed manually once. Forged
+or hybrid definitions are never treated as owned.
 
 ### Previewing another platform's unit
 

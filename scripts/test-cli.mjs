@@ -25,12 +25,20 @@ async function checkAsync(name, fn) {
 }
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 function taskLaunchText(content) {
-  const encodedCommand = /-EncodedCommand\s+([A-Za-z0-9+/=]+)/.exec(content)?.[1];
-  assert(encodedCommand, "Windows task is missing EncodedCommand");
-  const script = Buffer.from(encodedCommand, "base64").toString("utf16le");
-  const encodedPayload = /FromBase64String\('([A-Za-z0-9+/=]+)'\)/.exec(script)?.[1];
-  assert(encodedPayload, "Windows task is missing its encoded launch payload");
-  return Buffer.from(encodedPayload, "base64").toString("utf-8");
+  const encodedPayload = /<Arguments>([A-Za-z0-9+/=]+)<\/Arguments>/.exec(content)?.[1];
+  assert(encodedPayload, "Windows task is missing its opaque native launch payload");
+  const bytes = Buffer.from(encodedPayload, "base64");
+  let offset = 0;
+  assert(bytes.subarray(offset, offset += 4).toString("ascii") === "CLC2", "Windows task payload version");
+  const field = () => {
+    const length = bytes.readInt32LE(offset); offset += 4;
+    return bytes.subarray(offset, offset += length).toString("utf-8");
+  };
+  const payload = { execPath: field(), argumentLine: field(), workingDirectory: field(), logPath: field(), env: {} };
+  const count = bytes.readInt32LE(offset); offset += 4;
+  for (let index = 0; index < count; index++) payload.env[field()] = field();
+  assert(offset === bytes.length, "Windows task payload has trailing data");
+  return JSON.stringify(payload);
 }
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -389,6 +397,7 @@ await checkAsync("service --dry-run prints a unit without installing anything", 
     const launch = platform === "win32" ? taskLaunchText(plan.content) : plan.content;
     assert(launch.includes("--no-tunnel"), `${platform}: the unit should not manage the tunnel`);
     assert(launch.includes("up"), `${platform}: the unit should run \`up\``);
+    assert(launch.includes("CLC_SERVICE_MODE") && launch.includes("1"), `${platform}: managed mode marker is missing`);
     assert(plan.installCommands.length >= 1, `${platform}: no install command`);
 
     let created = true;

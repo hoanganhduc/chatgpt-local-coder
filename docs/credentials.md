@@ -241,9 +241,9 @@ report.
 One credential is not a stored secret and is treated differently: the admin token
 the host generates when `ADMIN_TOKEN` is unset. It has to reach you somehow, so
 it is printed as a ready-to-open URL — but only to an attached terminal. Started
-as a service, stdout goes to the system journal, so the banner prints the path to
-a `0600` file holding the URL instead. Set `ADMIN_TOKEN` yourself and nothing is
-printed at all.
+as a service, `CLC_SERVICE_MODE=1` forces the banner to print the path to a
+restricted file holding the URL instead, even if stdout is unexpectedly attached.
+Set `ADMIN_TOKEN` yourself and no generated token is printed at all.
 
 ## How credentials reach tunnel-client
 
