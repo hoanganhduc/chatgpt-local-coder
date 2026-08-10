@@ -1,19 +1,37 @@
 /**
  * Integration: hub server + mock upstream + meta tools + proxy tool.
- * Self-contained — spawns child processes on random ports.
+ * Self-contained — spawns child processes on OS-assigned loopback ports.
  */
 import fs from "fs/promises";
 import path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "node:child_process";
+import net from "node:net";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
 const scratch = process.env.GOAL_SCRATCH || path.join(root, ".tool-test-tmp", "bridge-integration");
 
-const mcpPort = 4100 + Math.floor(Math.random() * 200);
-const adminPort = mcpPort + 1;
-const mockPort = mcpPort + 2;
+async function allocateLoopbackPorts(count) {
+  const servers = [];
+  try {
+    for (let index = 0; index < count; index++) {
+      const server = net.createServer();
+      await new Promise((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      servers.push(server);
+    }
+    return servers.map((server) => server.address().port);
+  } finally {
+    await Promise.all(
+      servers.map((server) => new Promise((resolve) => server.close(resolve)))
+    );
+  }
+}
+
+const [mcpPort, adminPort, mockPort] = await allocateLoopbackPorts(3);
 const tmpDir = path.join(scratch, `run-${mcpPort}`);
 
 function spawnNode(script, env = {}) {
@@ -128,6 +146,15 @@ mockHttp.stdout.on("data", (d) => (mockLog += d.toString()));
 mockHttp.stderr.on("data", (d) => (mockLog += d.toString()));
 hub.on("exit", (code) => {
   hubLog += `\n[hub exit ${code}]`;
+});
+hub.on("error", (error) => {
+  hubLog += `\n[hub error ${error.message}]`;
+});
+mockHttp.on("exit", (code) => {
+  mockLog += `\n[mock exit ${code}]`;
+});
+mockHttp.on("error", (error) => {
+  mockLog += `\n[mock error ${error.message}]`;
 });
 
 const logLines = [];
@@ -272,7 +299,8 @@ try {
   await fs.writeFile(path.join(scratch, "hub-boot.log"), hubLog + "\n--- mock ---\n" + mockLog);
   await fs.writeFile(path.join(scratch, "integration-error.log"), String(err?.stack || err));
   console.error("FAIL bridge integration:", err.message || err);
-  console.error(hubLog.slice(-2000));
+  console.error(`--- hub ---\n${hubLog.slice(-2000)}`);
+  console.error(`--- mock ---\n${mockLog.slice(-2000)}`);
   failed = true;
 } finally {
   hub.kill("SIGTERM");

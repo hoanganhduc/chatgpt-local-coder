@@ -121,7 +121,8 @@ function commandRun({ exitCode = 0, stdout = "", stderr = "", spawnFailed = fals
   return { exitCode, stdout, stderr, spawnFailed, truncated, timedOut: false };
 }
 
-const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-services-"));
+const tmpRoot = await fs.realpath(os.tmpdir());
+const tmp = await fs.mkdtemp(path.join(tmpRoot, "clc-services-"));
 const home = path.join(tmp, "home");
 
 // A spec whose values are all absolute and all distinguishable in the output.
@@ -155,10 +156,21 @@ async function compileNativeLauncherFixture() {
   await fs.access(executable);
   return executable;
 }
-async function emulateSuccessfulLauncherCompile(args) {
-  const compiledFixture = await compileNativeLauncherFixture();
+async function emulateSuccessfulLauncherCompile(args, fixturePath) {
   const { outputPath } = launcherCompilePaths(args);
-  await fs.copyFile(compiledFixture, outputPath);
+  if (fixturePath) {
+    await fs.copyFile(fixturePath, outputPath);
+    return;
+  }
+  const fixture = Buffer.alloc(256);
+  const peOffset = 0x40;
+  const optionalHeader = peOffset + 24;
+  fixture.writeUInt16LE(0x5a4d, 0);
+  fixture.writeUInt32LE(peOffset, 0x3c);
+  fixture.writeUInt32LE(0x00004550, peOffset);
+  fixture.writeUInt16LE(0x10b, optionalHeader);
+  fixture.writeUInt16LE(2, optionalHeader + 68);
+  await fs.writeFile(outputPath, fixture);
 }
 async function readStagedTaskXml(fakeHome) {
   return (await fs.readFile(taskXmlPath(fakeHome))).toString("utf16le").replace(/^\uFEFF/, "");
@@ -804,7 +816,7 @@ await checkAsync("a binary-hash publication collision fails closed without overw
     runner: async (command, args) => {
       if (args.includes("/Query")) return commandRun({ exitCode: 1, stderr: "task not found" });
       if (/powershell\.exe$/i.test(command)) {
-        await emulateSuccessfulLauncherCompile(args);
+        await emulateSuccessfulLauncherCompile(args, compiledFixture);
         return commandRun();
       }
       createCalls++;
