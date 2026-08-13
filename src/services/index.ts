@@ -629,6 +629,27 @@ export async function installService(
     }
   }
 
+  // Windows stages, publishes and rolls back its own files — including the true
+  // previous task XML, which it snapshots itself. Nothing may be written here
+  // before it runs, or that snapshot captures the new content and a failed
+  // install "restores" what it was supposed to undo. Ownership metadata is this
+  // layer's concern, and is recorded only once the task actually committed.
+  if (platform === "win32") {
+    const result = await installWindowsService(spec, plan, home, runner);
+    if (result.commandResults.every((entry) => entry.exitCode === 0)) {
+      if (spec.stopArgs) {
+        await fs.writeFile(
+          ownershipMetadataPath(result.plan),
+          `${JSON.stringify({ version: 1, spec }, null, 2)}\n`,
+          { encoding: "utf-8", mode: 0o600 }
+        );
+      } else {
+        await fs.rm(ownershipMetadataPath(result.plan), { force: true });
+      }
+    }
+    return { ...result, metadataPresent: await metadataPresent(result.plan) };
+  }
+
   await fs.mkdir(path.dirname(plan.unitPath), { recursive: true });
   await fs.mkdir(path.dirname(spec.logPath), { recursive: true });
   let previous: Buffer | undefined;
@@ -663,17 +684,6 @@ export async function installService(
     }
   } else {
     await fs.rm(ownershipMetadataPath(plan), { force: true });
-  }
-
-  if (platform === "win32") {
-    const result = await installWindowsService(spec, plan, home, runner);
-    if (result.commandResults.some((entry) => entry.exitCode !== 0)) {
-      if (previous !== undefined) await fs.writeFile(plan.unitPath, previous);
-      else await fs.rm(plan.unitPath, { force: true });
-      if (previousOwnership !== undefined) await fs.writeFile(ownershipMetadataPath(plan), previousOwnership);
-      else await fs.rm(ownershipMetadataPath(plan), { force: true });
-    }
-    return { ...result, metadataPresent: await metadataPresent(plan) };
   }
 
   const commandResults = await runAll(installCommands, runner);

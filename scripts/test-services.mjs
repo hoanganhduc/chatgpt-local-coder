@@ -174,12 +174,7 @@ async function compileNativeLauncherFixture() {
   await fs.access(executable);
   return executable;
 }
-async function emulateSuccessfulLauncherCompile(args, fixturePath) {
-  const { outputPath } = launcherCompilePaths(args);
-  if (fixturePath) {
-    await fs.copyFile(fixturePath, outputPath);
-    return;
-  }
+function syntheticGuiExecutable() {
   const fixture = Buffer.alloc(256);
   const peOffset = 0x40;
   const optionalHeader = peOffset + 24;
@@ -188,10 +183,31 @@ async function emulateSuccessfulLauncherCompile(args, fixturePath) {
   fixture.writeUInt32LE(0x00004550, peOffset);
   fixture.writeUInt16LE(0x10b, optionalHeader);
   fixture.writeUInt16LE(2, optionalHeader + 68);
-  await fs.writeFile(outputPath, fixture);
+  return fixture;
 }
-async function readStagedTaskXml(fakeHome) {
-  return (await fs.readFile(taskXmlPath(fakeHome))).toString("utf16le").replace(/^\uFEFF/, "");
+async function emulateSuccessfulLauncherCompile(args, fixturePath) {
+  const { outputPath } = launcherCompilePaths(args);
+  if (fixturePath) {
+    await fs.copyFile(fixturePath, outputPath);
+    return;
+  }
+  await fs.writeFile(outputPath, syntheticGuiExecutable());
+}
+// A native task is owned only while its launcher bytes hash to the digest in
+// their own filename, so a fake home must carry that pair before any emulated
+// /Query can report the task as ours.
+async function stageOwnedNativeTask(taskSpec, fakeHome) {
+  const bytes = syntheticGuiExecutable();
+  const executable = windowsLauncherExecutablePath(
+    fakeHome,
+    createHash("sha256").update(bytes).digest("hex")
+  );
+  await fs.mkdir(path.dirname(executable), { recursive: true });
+  await fs.writeFile(executable, bytes);
+  return renderTaskXml(taskSpec, process.env, fakeHome, executable);
+}
+async function readStagedTaskXml(fakeHome, role) {
+  return (await fs.readFile(taskXmlPath(fakeHome, role))).toString("utf16le").replace(/^\uFEFF/, "");
 }
 function currentWindowsIdentity() {
   const whoami = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "whoami.exe");
@@ -590,7 +606,7 @@ check("the tunnel role gets its own unit, label, and task on every platform", ()
     const tunnel = servicePlan(tunnelSpec, platform, home);
     assert(tunnel.unitPath !== host.unitPath, `${platform}: the two units would overwrite each other`);
     assert(tunnel.mechanism === host.mechanism, `${platform}: both roles use the same mechanism`);
-    const launchContent = platform === "win32" ? taskPayload(tunnel.content).argumentLine : tunnel.content;
+    const launchContent = platform === "win32" ? nativeTaskPayload(tunnel.content).argumentLine : tunnel.content;
     for (const token of ["tunnel", "connect", "--wait-for-server"]) {
       includes(launchContent, token, `${platform}: connect argv`);
     }
@@ -694,11 +710,12 @@ await checkAsync("every tunnel uninstall explicitly stops the external runtime a
     await fs.mkdir(path.dirname(unit), { recursive: true });
     await fs.writeFile(unit, "tunnel recovery metadata", "utf-8");
 
+    const ownedTask = platform === "win32" ? await stageOwnedNativeTask(tunnelSpec, fakeHome) : undefined;
     const calls = [];
     const runner = async (command, args) => {
       calls.push([command, args]);
       if (platform === "win32" && args.includes("/Query")) {
-        return commandRun({ stdout: renderTaskXml(tunnelSpec) });
+        return commandRun({ stdout: ownedTask });
       }
       return commandRun();
     };
@@ -725,11 +742,12 @@ await checkAsync("tunnel uninstall retries still stop the external runtime after
     await fs.mkdir(path.dirname(unit), { recursive: true });
     await fs.writeFile(unit, "tunnel recovery metadata", "utf-8");
 
+    const ownedTask = platform === "win32" ? await stageOwnedNativeTask(tunnelSpec, fakeHome) : undefined;
     let wrapperExists = true;
     let runtimeRunning = true;
     const firstRunner = async (_command, args) => {
       if (platform === "win32" && args.includes("/Query")) {
-        return commandRun({ stdout: renderTaskXml(tunnelSpec) });
+        return commandRun({ stdout: ownedTask });
       }
       if (args.includes("disable") || args.includes("bootout") || args.includes("/Delete")) {
         wrapperExists = false;
@@ -785,10 +803,21 @@ await checkAsync("installed ownership metadata pins tunnel cleanup across config
   for (const platform of ["linux", "darwin", "win32"]) {
     const fakeHome = path.join(tmp, `${platform}-pinned-alias-home`);
     const plan = servicePlan(specA, platform, fakeHome);
-    const installRunner = async (_command, args) => {
+    // Windows installs the task through a freshly compiled native launcher, so
+    // the emulated queries must go from absent to the definition install itself
+    // staged; anything else fails the post-create ownership check.
+    let taskCreated = false;
+    const installRunner = async (command, args) => {
       if (platform === "win32" && args.includes("/Query")) {
-        return commandRun({ exitCode: 1, stderr: "task not found" });
+        return taskCreated
+          ? commandRun({ stdout: await readStagedTaskXml(fakeHome, "tunnel") })
+          : commandRun({ exitCode: 1, stderr: "task not found" });
       }
+      if (platform === "win32" && /powershell\.exe$/i.test(command)) {
+        await emulateSuccessfulLauncherCompile(args);
+        return commandRun();
+      }
+      if (platform === "win32" && args.includes("/Create")) taskCreated = true;
       return commandRun();
     };
     const installed = await installService(specA, platform, { home: fakeHome, runner: installRunner });
@@ -798,7 +827,7 @@ await checkAsync("installed ownership metadata pins tunnel cleanup across config
     let stoppedArgs;
     const uninstallRunner = async (_command, args) => {
       if (platform === "win32" && args.includes("/Query")) {
-        return commandRun({ stdout: renderTaskXml(specA) });
+        return commandRun({ stdout: await readStagedTaskXml(fakeHome, "tunnel") });
       }
       if (args.includes("stop")) stoppedArgs = args;
       return commandRun();
@@ -861,9 +890,10 @@ await checkAsync("Windows stopService targets the owned tunnel task, never the h
   const unit = taskXmlPath(fakeHome, "tunnel");
   await fs.mkdir(path.dirname(unit), { recursive: true });
   await fs.writeFile(unit, "tunnel metadata", "utf-8");
+  const ownedTask = await stageOwnedNativeTask(tunnelSpec, fakeHome);
   let endArgs;
   const runner = async (_command, args) => {
-    if (args.includes("/Query")) return commandRun({ stdout: renderTaskXml(tunnelSpec) });
+    if (args.includes("/Query")) return commandRun({ stdout: ownedTask });
     if (args.includes("/End")) endArgs = args;
     return commandRun();
   };
