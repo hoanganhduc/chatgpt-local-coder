@@ -74,7 +74,12 @@ export function registerDelegateTools(server: McpServer, opts: DelegateToolOptio
         preferred = agent ?? found.frontmatter.agent;
       }
 
+      // The configured ceiling is a ceiling: a caller may ask for less time,
+      // never more. A cut-down request is reported rather than applied in
+      // silence, because the caller otherwise sees only a timeout that arrived
+      // long before the one it asked for and has nothing to attribute it to.
       const timeoutSec = Math.min(timeout_sec ?? opts.timeoutSec, opts.timeoutSec);
+      const timeoutCapped = timeout_sec !== undefined && timeout_sec > opts.timeoutSec;
 
       try {
         const result = await runDelegate({
@@ -103,7 +108,7 @@ export function registerDelegateTools(server: McpServer, opts: DelegateToolOptio
           tool: "agent_delegate",
           action: "execute",
           target: result.delegate,
-          status: result.exitCode === 0 ? "ok" : "error",
+          status: result.exitCode === 0 && !result.timedOut ? "ok" : "error",
           details: { skill: skillName, exit_code: result.exitCode, cwd: result.cwd },
         });
 
@@ -118,6 +123,8 @@ export function registerDelegateTools(server: McpServer, opts: DelegateToolOptio
             stderr: result.stderr,
             truncated: result.truncated,
             timed_out: result.timedOut,
+            timeout_sec: timeoutSec,
+            timeout_capped: timeoutCapped,
           },
           {
             ok: result.exitCode === 0 && !result.timedOut,

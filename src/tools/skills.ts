@@ -128,8 +128,11 @@ export function registerSkillTools(server: McpServer, opts: SkillToolOptions): v
     async ({ name, args, cwd, timeout_sec }) => {
       try {
         // The configured ceiling is a ceiling: a caller may ask for less time,
-        // never more.
+        // never more. A cut-down request is reported rather than applied in
+        // silence, because the caller otherwise sees only a timeout that
+        // arrived early and has nothing to attribute it to.
         const timeoutSec = Math.min(timeout_sec ?? opts.maxRuntimeSec, opts.maxRuntimeSec);
+        const timeoutCapped = timeout_sec !== undefined && timeout_sec > opts.maxRuntimeSec;
         const result = await runSkill(name, {
           args,
           cwd,
@@ -141,7 +144,7 @@ export function registerSkillTools(server: McpServer, opts: SkillToolOptions): v
           tool: "skill_run",
           action: "execute",
           target: result.entrypoint,
-          status: result.exitCode === 0 ? "ok" : "error",
+          status: result.exitCode === 0 && !result.timedOut ? "ok" : "error",
           details: { skill: result.skill, runtime: result.runtime, exit_code: result.exitCode },
         });
 
@@ -156,6 +159,8 @@ export function registerSkillTools(server: McpServer, opts: SkillToolOptions): v
             stderr: result.stderr,
             exit_code: result.exitCode,
             timed_out: result.timedOut,
+            timeout_sec: timeoutSec,
+            timeout_capped: timeoutCapped,
           },
           {
             ok: result.exitCode === 0 && !result.timedOut,
