@@ -8,6 +8,7 @@
  */
 import { spawn } from "child_process";
 import fs from "fs";
+import net from "net";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -212,6 +213,48 @@ if (lanIp) {
     server.child.kill();
     if (inherited !== undefined) process.env.ADMIN_TOKEN = inherited;
     fs.rmSync(path.join(sandbox, "secrets.json"), { force: true });
+  }
+}
+
+// --- a taken port is reported, not thrown -------------------------------
+//
+// The MCP listener has always had an EADDRINUSE handler; the admin listener had
+// none, so a second instance died on an unhandled 'error' event with a raw Node
+// stack trace naming a port most operators never set.
+for (const [name, held] of [["MCP", "PORT"], ["admin", "ADMIN_PORT"]]) {
+  const port = basePort + 40 + (held === "PORT" ? 0 : 2);
+  const blocker = net.createServer();
+  const blockedPort = held === "PORT" ? port : port + 1;
+  await new Promise((resolve) => blocker.listen(blockedPort, "127.0.0.1", resolve));
+
+  const server = startServer({ PORT: String(port), ADMIN_PORT: String(port + 1) });
+  try {
+    const code = await new Promise((resolve) => {
+      const timer = setTimeout(() => resolve("timeout"), 20_000);
+      server.child.on("exit", (c) => { clearTimeout(timer); resolve(c); });
+    });
+    const log = server.log();
+
+    if (code !== 1) {
+      fail(`${name} port collision`, `expected a clean exit 1, got ${code}\n${log}`);
+    } else {
+      ok(`a taken ${name} port exits 1 rather than crashing`);
+    }
+
+    if (!new RegExp(`${name === "MCP" ? "Port" : "Admin port"} ${blockedPort} is already in use`, "i").test(log)) {
+      fail(`${name} port collision`, `the message should name the port and the problem:\n${log}`);
+    } else {
+      ok(`a taken ${name} port is explained by port number`);
+    }
+
+    if (/Unhandled 'error' event|at Server\.setupListenHandle/.test(log)) {
+      fail(`${name} port collision`, `a stack trace reached the operator:\n${log}`);
+    } else {
+      ok(`a taken ${name} port produces no stack trace`);
+    }
+  } finally {
+    server.child.kill();
+    await new Promise((resolve) => blocker.close(resolve));
   }
 }
 

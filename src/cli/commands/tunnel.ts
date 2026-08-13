@@ -10,6 +10,7 @@ import fs from "fs/promises";
 import path from "path";
 
 import { loadConfig } from "../../config/load.js";
+import { healthUrlForMcpUrl, waitForMcpHealth } from "../../lib/port-probe.js";
 import { getSecret, secretFileReference } from "../../lib/secrets.js";
 import {
   defaultProfileDir,
@@ -24,7 +25,7 @@ import {
   type ConnectResult,
   type TunnelCommandResult,
 } from "../../tunnel/index.js";
-import { flag, optionalString, parseCommand, UsageError, type CommandSpec } from "../args.js";
+import { flag, integer, optionalString, parseCommand, UsageError, type CommandSpec } from "../args.js";
 
 export const TUNNEL_SUBCOMMANDS = ["init", "connect", "status", "stop", "rm"];
 
@@ -46,6 +47,15 @@ export const TUNNEL_SPEC: CommandSpec = {
     "mcp-url": { type: "string", description: "MCP URL to publish. Defaults to the configured port.", placeholder: "url" },
     profile: { type: "string", description: "Generated profile name. Defaults to the alias.", placeholder: "name" },
     "profile-dir": { type: "string", description: "Where generated profiles are written.", placeholder: "dir" },
+    "wait-for-server": {
+      type: "boolean",
+      description: "Wait for the MCP server to answer before connecting.",
+    },
+    "wait-timeout": {
+      type: "string",
+      description: "Seconds to wait with --wait-for-server. Defaults to 60.",
+      placeholder: "s",
+    },
     json: { type: "boolean", description: "Emit the raw JSON result." },
   },
 };
@@ -176,11 +186,40 @@ export async function runTunnel(argv: string[], cwd = process.cwd()): Promise<nu
   const binary = await requireBinary(config.tunnel.binPath, false);
 
   if (sub === "connect") {
+    const mcpUrl = optionalString(parsed.values, "mcp-url") ?? `http://127.0.0.1:${config.port}/mcp`;
+
+    // A service-started tunnel races the host it publishes. Ordering the units
+    // is not enough: a supervisor calls a unit started once its process has
+    // forked, which is well before the server has bound its port, and the
+    // runtime reports itself healthy while separately recording that it never
+    // reached the MCP host — so the race resolves quietly into a tunnel that
+    // points at nothing. Waiting here rather than in a per-platform ExecStartPre
+    // keeps one implementation for all three service back ends.
+    if (flag(parsed.values, "wait-for-server")) {
+      const seconds = integer(parsed.values, "wait-timeout") ?? 60;
+      if (seconds <= 0) {
+        throw new UsageError(`--wait-timeout expects a positive number of seconds, got "${optionalString(parsed.values, "wait-timeout")}"`);
+      }
+      let healthUrl: string;
+      try {
+        healthUrl = healthUrlForMcpUrl(mcpUrl);
+      } catch (error) {
+        throw new UsageError(`--mcp-url is not a valid HTTP(S) URL: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      if (!(await waitForMcpHealth(mcpUrl, seconds * 1000))) {
+        console.error(
+          `The MCP server did not answer at ${healthUrl} within ${seconds}s — not connecting a tunnel.`
+        );
+        console.error("Start it with `chatgpt-local-coder up`, or install it as a service first.");
+        return 1;
+      }
+    }
+
     const plan = await planConnect({
       alias,
       profile: optionalString(parsed.values, "profile"),
       profileDir: optionalString(parsed.values, "profile-dir"),
-      mcpUrl: optionalString(parsed.values, "mcp-url"),
+      mcpUrl,
       tunnelId: optionalString(parsed.values, "tunnel-id"),
       cwd,
     });

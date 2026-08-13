@@ -2,10 +2,15 @@
  * Service installation.
  *
  * The unit is generated from a `ServiceSpec` and written to a per-user location
- * on all three platforms; nothing here needs or requests elevation. Tunnel
- * lifecycle is deliberately absent — that belongs to tunnel-client's own
- * managed runtimes, and duplicating it here would give two supervisors for one
- * process.
+ * on all three platforms; nothing here needs or requests elevation.
+ *
+ * A spec carries a `role`, and the two roles produce two separate units. The
+ * host unit runs the server. The tunnel unit runs `tunnel connect`, which hands
+ * the runtime to tunnel-client's own supervisor and returns — so the tunnel
+ * unit takes lifecycle responsibility for a runtime it does not supervise.
+ * That is why the tunnel spec also carries `stopArgs`: the runtime lives
+ * outside the unit, and only `tunnel stop` can reach it. Installing that unit
+ * explicitly transfers responsibility for the configured alias to the service.
  */
 
 import { createHash, randomUUID } from "node:crypto";
@@ -26,14 +31,29 @@ import {
   windowsLauncherSupportDirectory,
   windowsPlan,
   windowsTaskLauncherExecutablePath,
+  windowsTaskName,
   windowsTaskQueryCommand,
 } from "./windows.js";
 import { WINDOWS_LAUNCHER_SOURCE } from "./windows-launcher.js";
-import type { ServicePlan, ServiceSpec, ServiceStatus } from "./types.js";
+import type { ServiceCommand, ServicePlan, ServiceSpec, ServiceStatus } from "./types.js";
 
 export * from "./types.js";
-export { renderSystemdUnit, systemdUnitPath, systemdPlan, UNIT_NAME } from "./systemd.js";
-export { renderLaunchAgent, launchdPlistPath, launchdPlan, LABEL } from "./launchd.js";
+export {
+  renderSystemdUnit,
+  systemdUnitName,
+  systemdUnitPath,
+  systemdPlan,
+  UNIT_NAME,
+  TUNNEL_UNIT_NAME,
+} from "./systemd.js";
+export {
+  renderLaunchAgent,
+  launchdLabel,
+  launchdPlistPath,
+  launchdPlan,
+  LABEL,
+  TUNNEL_LABEL,
+} from "./launchd.js";
 export {
   isOwnedWindowsTask,
   renderWindowsPowerShellPredecessorTaskXml,
@@ -46,9 +66,11 @@ export {
   windowsArgumentLine,
   windowsPlan,
   windowsTaskLauncherExecutablePath,
+  windowsTaskName,
   windowsTaskQueryCommand,
   TASK_NAME,
   TASK_OWNERSHIP_MARKER,
+  TUNNEL_TASK_NAME,
 } from "./windows.js";
 export {
   WINDOWS_LAUNCHER_BASENAME,
@@ -140,13 +162,14 @@ async function runOne(
 
 async function runAll(
   commands: ServicePlan["installCommands"],
-  runner: typeof runExecutable
+  runner: typeof runExecutable,
+  continueAfterFailure = false
 ): Promise<InstallResult["commandResults"]> {
   const results: InstallResult["commandResults"] = [];
   for (const [command, args] of commands) {
     const { summary } = await runOne(command, args, runner);
     results.push(summary);
-    if (summary.exitCode !== 0) break;
+    if (summary.exitCode !== 0 && !continueAfterFailure) break;
   }
   return results;
 }
@@ -161,6 +184,78 @@ async function fileExists(file: string): Promise<boolean> {
   }
 }
 
+function uninstallMarkerPath(plan: ServicePlan): string {
+  return `${plan.unitPath}.uninstalling`;
+}
+
+function ownershipMetadataPath(plan: ServicePlan): string {
+  return `${plan.unitPath}.owner.json`;
+}
+
+function isStringRecord(value: unknown): value is Record<string, string> {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    !Array.isArray(value) &&
+    Object.values(value).every((entry) => typeof entry === "string")
+  );
+}
+
+function isStoredServiceSpec(value: unknown): value is ServiceSpec {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const candidate = value as Partial<ServiceSpec>;
+  return (
+    typeof candidate.execPath === "string" &&
+    Array.isArray(candidate.args) &&
+    candidate.args.every((entry) => typeof entry === "string") &&
+    typeof candidate.workingDirectory === "string" &&
+    typeof candidate.description === "string" &&
+    typeof candidate.logPath === "string" &&
+    isStringRecord(candidate.env) &&
+    (candidate.role === "host" || candidate.role === "tunnel" || candidate.role === undefined) &&
+    Array.isArray(candidate.stopArgs) &&
+    candidate.stopArgs.every((entry) => typeof entry === "string")
+  );
+}
+
+async function loadOwnedServiceSpec(plan: ServicePlan, requested: ServiceSpec): Promise<ServiceSpec> {
+  let raw: string;
+  try {
+    raw = await fs.readFile(ownershipMetadataPath(plan), "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return requested;
+    throw error;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`refusing service cleanup with invalid ownership metadata at ${ownershipMetadataPath(plan)}`);
+  }
+  const record = parsed as { version?: unknown; spec?: unknown };
+  if (record.version !== 1 || !isStoredServiceSpec(record.spec)) {
+    throw new Error(`refusing service cleanup with invalid ownership metadata at ${ownershipMetadataPath(plan)}`);
+  }
+  if (
+    (record.spec.role ?? "host") !== (requested.role ?? "host") ||
+    record.spec.execPath !== requested.execPath ||
+    record.spec.args[0] !== requested.args[0] ||
+    record.spec.stopArgs?.[0] !== requested.stopArgs?.[0]
+  ) {
+    throw new Error(`refusing service cleanup with mismatched ownership metadata at ${ownershipMetadataPath(plan)}`);
+  }
+  return record.spec;
+}
+
+async function metadataPresent(plan: ServicePlan): Promise<boolean> {
+  return (
+    (await fileExists(plan.unitPath)) ||
+    (await fileExists(ownershipMetadataPath(plan))) ||
+    (await fileExists(uninstallMarkerPath(plan)))
+  );
+}
+
 async function probeWindowsTask(spec: ServiceSpec, runner: typeof runExecutable, home: string): Promise<{
   exists: boolean;
   owned: boolean;
@@ -169,7 +264,9 @@ async function probeWindowsTask(spec: ServiceSpec, runner: typeof runExecutable,
   taskXml?: string;
   launcherPath?: string;
 }> {
-  const [command, args] = windowsTaskQueryCommand();
+  const role = spec.role ?? "host";
+  const task = windowsTaskName(role);
+  const [command, args] = windowsTaskQueryCommand(role);
   const { summary, run } = await runOne(command, args, runner);
   if (run.spawnFailed || run.exitCode === null || run.truncated) {
     const blocking =
@@ -209,7 +306,7 @@ async function probeWindowsTask(spec: ServiceSpec, runner: typeof runExecutable,
     blocking: {
       command: summary.command,
       exitCode: 1,
-      stderr: `refusing to modify existing unowned Scheduled Task ${JSON.stringify(TASK_NAME)}`,
+      stderr: `refusing to modify existing unowned Scheduled Task ${JSON.stringify(task)}`,
     },
   };
 }
@@ -513,13 +610,36 @@ export async function installService(
   const home = options.home ?? os.homedir();
   const plan = servicePlan(spec, platform, home);
   const runner = options.runner ?? runExecutable;
-  if (platform === "win32") return installWindowsService(spec, plan, home, runner);
+  let installCommands = plan.installCommands;
+
+  if (spec.stopArgs) {
+    if (await fileExists(uninstallMarkerPath(plan))) {
+      throw new Error(
+        `refusing to install while tunnel cleanup is pending at ${uninstallMarkerPath(plan)}; run service uninstall first`
+      );
+    }
+    const installedSpec = await loadOwnedServiceSpec(plan, spec);
+    if (
+      JSON.stringify(installedSpec.args) !== JSON.stringify(spec.args) ||
+      JSON.stringify(installedSpec.stopArgs) !== JSON.stringify(spec.stopArgs)
+    ) {
+      throw new Error(
+        `refusing to change the service-owned tunnel lifecycle in place; uninstall the existing companion first`
+      );
+    }
+  }
 
   await fs.mkdir(path.dirname(plan.unitPath), { recursive: true });
   await fs.mkdir(path.dirname(spec.logPath), { recursive: true });
   let previous: Buffer | undefined;
+  let previousOwnership: Buffer | undefined;
   try {
     previous = await fs.readFile(plan.unitPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  try {
+    previousOwnership = await fs.readFile(ownershipMetadataPath(plan));
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
@@ -527,9 +647,37 @@ export async function installService(
   const encoding = plan.mechanism === "schtasks-logon" ? "utf16le" : "utf-8";
   const body = encoding === "utf16le" ? `﻿${plan.content}` : plan.content;
   await fs.writeFile(plan.unitPath, body, encoding);
+  if (spec.stopArgs) {
+    try {
+      await fs.writeFile(
+        ownershipMetadataPath(plan),
+        `${JSON.stringify({ version: 1, spec }, null, 2)}\n`,
+        { encoding: "utf-8", mode: 0o600 }
+      );
+    } catch (error) {
+      if (previous !== undefined) await fs.writeFile(plan.unitPath, previous);
+      else await fs.rm(plan.unitPath, { force: true });
+      if (previousOwnership !== undefined) await fs.writeFile(ownershipMetadataPath(plan), previousOwnership);
+      else await fs.rm(ownershipMetadataPath(plan), { force: true });
+      throw error;
+    }
+  } else {
+    await fs.rm(ownershipMetadataPath(plan), { force: true });
+  }
 
-  const commandResults = await runAll(plan.installCommands, runner);
-  return { plan, unitWritten: plan.unitPath, commandResults, metadataPresent: await fileExists(plan.unitPath) };
+  if (platform === "win32") {
+    const result = await installWindowsService(spec, plan, home, runner);
+    if (result.commandResults.some((entry) => entry.exitCode !== 0)) {
+      if (previous !== undefined) await fs.writeFile(plan.unitPath, previous);
+      else await fs.rm(plan.unitPath, { force: true });
+      if (previousOwnership !== undefined) await fs.writeFile(ownershipMetadataPath(plan), previousOwnership);
+      else await fs.rm(ownershipMetadataPath(plan), { force: true });
+    }
+    return { ...result, metadataPresent: await metadataPresent(plan) };
+  }
+
+  const commandResults = await runAll(installCommands, runner);
+  return { plan, unitWritten: plan.unitPath, commandResults, metadataPresent: await metadataPresent(plan) };
 }
 
 export async function uninstallService(
@@ -538,34 +686,109 @@ export async function uninstallService(
   options: ServiceOperationOptions = {}
 ): Promise<InstallResult> {
   const home = options.home ?? os.homedir();
-  const plan = servicePlan(spec, platform, home);
+  const requestedPlan = servicePlan(spec, platform, home);
+  const ownedSpec = spec.stopArgs ? await loadOwnedServiceSpec(requestedPlan, spec) : spec;
+  const plan = servicePlan(ownedSpec, platform, home);
   const runner = options.runner ?? runExecutable;
+  const externalCleanup = Boolean(ownedSpec.stopArgs);
+  const markerPath = uninstallMarkerPath(plan);
+  const cleanupPending = externalCleanup && (await fileExists(markerPath));
 
   if (platform === "win32") {
-    const probe = await probeWindowsTask(spec, runner, home);
-    if (probe.blocking || !probe.exists) {
+    const probe = await probeWindowsTask(ownedSpec, runner, home);
+    if (probe.blocking) {
       return {
         plan,
         unitWritten: plan.unitPath,
-        commandResults: [probe.blocking ?? probe.query],
-        metadataPresent: await fileExists(plan.unitPath),
+        commandResults: [probe.blocking],
+        metadataPresent: await metadataPresent(plan),
       };
+    }
+    if (!probe.exists) {
+      const hasMetadata = await metadataPresent(plan);
+      if (cleanupPending && ownedSpec.stopArgs) {
+        // The marker was written only after an owned wrapper was successfully
+        // deleted. Its failed query is therefore the expected retry state, not
+        // an ownership ambiguity. Finish the external cleanup and converge.
+        const commandResults = await runAll([[ownedSpec.execPath, ownedSpec.stopArgs]], runner);
+        if (commandResults.every((entry) => entry.exitCode === 0)) {
+          await fs.rm(plan.unitPath, { force: true });
+          await fs.rm(markerPath, { force: true });
+          await fs.rm(ownershipMetadataPath(plan), { force: true });
+        }
+        return {
+          plan,
+          unitWritten: plan.unitPath,
+          commandResults,
+          metadataPresent: await metadataPresent(plan),
+        };
+      }
+      // A non-zero query may mean absent, denied, or another manager error. The
+      // durable uninstall marker is the only proof that our owned wrapper was
+      // already removed, so metadata alone never authorizes an alias stop.
+      return { plan, unitWritten: plan.unitPath, commandResults: [probe.query], metadataPresent: hasMetadata };
     }
   }
 
-  const commandResults = await runAll(plan.uninstallCommands, runner);
-  if (commandResults.every((entry) => entry.exitCode === 0)) {
-    if (platform === "win32") {
-      // schtasks reports absence, access denial, and RPC failures through the
-      // same localized non-zero channel. Remove only the retry XML here and
-      // retain inert, content-addressed launcher support rather than risk
-      // deleting a binary that Task Scheduler may still reference.
+  if (cleanupPending && ownedSpec.stopArgs) {
+    const commandResults = await runAll([[ownedSpec.execPath, ownedSpec.stopArgs]], runner);
+    if (commandResults.every((entry) => entry.exitCode === 0)) {
       await fs.rm(plan.unitPath, { force: true });
-    } else {
-      await fs.rm(plan.unitPath, { force: true });
+      await fs.rm(markerPath, { force: true });
+      await fs.rm(ownershipMetadataPath(plan), { force: true });
+    }
+    return {
+      plan,
+      unitWritten: plan.unitPath,
+      commandResults,
+      metadataPresent: await metadataPresent(plan),
+    };
+  }
+
+  const commands: ServiceCommand[] = [...plan.uninstallCommands];
+
+  // The external stop is a cleanup step, not a dependent mutation. Run it even
+  // when unloading/deleting the wrapper fails so a retry cannot strand a live
+  // daemonized tunnel after its wrapper has already disappeared. This remains
+  // necessary on systemd because ExecStop is not guaranteed after a failed
+  // oneshot ExecStart.
+  const wrapperResults = externalCleanup ? await runAll(plan.uninstallCommands, runner) : undefined;
+  const commandResults = wrapperResults ?? (await runAll(commands, runner));
+  if (wrapperResults) {
+    const wrapperRemoved = wrapperResults.every((entry) => entry.exitCode === 0);
+    if (wrapperRemoved) {
+      try {
+        await fs.writeFile(markerPath, "owned service wrapper removed; external cleanup pending\n", {
+          encoding: "utf-8",
+          mode: 0o600,
+        });
+      } catch (error) {
+        commandResults.push({
+          command: `write ${markerPath}`,
+          exitCode: 1,
+          stderr: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    if (ownedSpec.stopArgs) {
+      commandResults.push(...(await runAll([[ownedSpec.execPath, ownedSpec.stopArgs]], runner)));
     }
   }
-  return { plan, unitWritten: plan.unitPath, commandResults, metadataPresent: await fileExists(plan.unitPath) };
+  if (commandResults.every((entry) => entry.exitCode === 0)) {
+    // schtasks reports absence, access denial, and RPC failures through the
+    // same localized non-zero channel. Remove only the retry XML here and
+    // retain inert, content-addressed launcher support rather than risk
+    // deleting a binary that Task Scheduler may still reference.
+    await fs.rm(plan.unitPath, { force: true });
+    await fs.rm(markerPath, { force: true });
+    await fs.rm(ownershipMetadataPath(plan), { force: true });
+  }
+  return {
+    plan,
+    unitWritten: plan.unitPath,
+    commandResults,
+    metadataPresent: await metadataPresent(plan),
+  };
 }
 
 export async function stopService(
@@ -574,17 +797,19 @@ export async function stopService(
   options: ServiceOperationOptions = {}
 ): Promise<InstallResult> {
   const home = options.home ?? os.homedir();
-  const plan = servicePlan(spec, platform, home);
+  const requestedPlan = servicePlan(spec, platform, home);
+  const ownedSpec = spec.stopArgs ? await loadOwnedServiceSpec(requestedPlan, spec) : spec;
+  const plan = servicePlan(ownedSpec, platform, home);
   const runner = options.runner ?? runExecutable;
 
   if (platform === "win32") {
-    const probe = await probeWindowsTask(spec, runner, home);
+    const probe = await probeWindowsTask(ownedSpec, runner, home);
     if (probe.blocking || !probe.exists) {
       return {
         plan,
         unitWritten: plan.unitPath,
         commandResults: [probe.blocking ?? probe.query],
-        metadataPresent: await fileExists(plan.unitPath),
+        metadataPresent: await metadataPresent(plan),
       };
     }
   }
@@ -593,7 +818,7 @@ export async function stopService(
     plan,
     unitWritten: plan.unitPath,
     commandResults: await runAll(plan.stopCommands, runner),
-    metadataPresent: await fileExists(plan.unitPath),
+    metadataPresent: await metadataPresent(plan),
   };
 }
 

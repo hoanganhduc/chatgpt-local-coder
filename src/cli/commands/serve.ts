@@ -15,11 +15,19 @@ import { fileURLToPath } from "url";
 import { loadConfig } from "../../config/load.js";
 import { stateDir } from "../../config/paths.js";
 import { platformId } from "../../lib/platform.js";
+import { portInUse, waitForServerHealth } from "../../lib/port-probe.js";
 import { serviceStatus } from "../../services/index.js";
-import { resolveTunnelBinary, tunnelConnect, tunnelStatus, tunnelStop } from "../../tunnel/index.js";
+import {
+  resolveTunnelBinary,
+  tunnelConnect,
+  tunnelStatus,
+  tunnelStop,
+  type ConnectResult,
+  type TunnelCommandResult,
+} from "../../tunnel/index.js";
 import { flag, integer, optionalString, parseCommand, UsageError, type CommandSpec } from "../args.js";
 import { defaultServiceSpec } from "./service.js";
-import { describeConnect, planConnect } from "./tunnel.js";
+import { describeConnect, planConnect, type ConnectPlan } from "./tunnel.js";
 
 /** `dist/cli/commands/serve.js` -> `dist/index.js`. */
 export function serverEntryPoint(): string {
@@ -32,6 +40,7 @@ export const UP_SPEC: CommandSpec = {
   options: {
     "no-tunnel": { type: "boolean", description: "Do not connect a tunnel runtime." },
     port: { type: "string", description: "Override the MCP port for this run.", placeholder: "n" },
+    "admin-port": { type: "string", description: "Override the admin UI port for this run.", placeholder: "n" },
     workspace: { type: "string", multiple: true, description: "Override the workspace roots.", placeholder: "path" },
     profile: { type: "string", description: "Override the permission profile.", placeholder: "name" },
     "tool-profile": { type: "string", description: "slim or full.", placeholder: "name" },
@@ -63,6 +72,11 @@ function childEnv(values: ReturnType<typeof parseCommand>["values"], cwd: string
   const port = integer(values, "port");
   if (port !== undefined) env.PORT = String(port);
 
+  // Overriding only the MCP port was not enough to run a second instance: the
+  // admin port stayed on its default and collided with the first one.
+  const adminPort = integer(values, "admin-port");
+  if (adminPort !== undefined) env.ADMIN_PORT = String(adminPort);
+
   const workspaces = Array.isArray(values.workspace)
     ? values.workspace
     : typeof values.workspace === "string"
@@ -81,19 +95,78 @@ function childEnv(values: ReturnType<typeof parseCommand>["values"], cwd: string
   return env;
 }
 
-async function waitForHealth(port: number, deadlineMs = 20_000): Promise<boolean> {
-  const started = Date.now();
-  while (Date.now() - started < deadlineMs) {
-    try {
-      const response = await fetch(`http://127.0.0.1:${port}/health`, { signal: AbortSignal.timeout(1500) });
-      if (response.ok) return true;
-    } catch {
-      /* not up yet */
-    }
-    await new Promise((resolve) => setTimeout(resolve, 500));
+/**
+ * Refuse to start a second host over a running one.
+ *
+ * This is not only a nicer error than the child's crash. `waitForServerHealth`
+ * below
+ * probes a port, and a port cannot say who is listening on it: when the
+ * installed service already held the MCP port, `up` saw *that* server answer,
+ * reported itself healthy in 0s, published a tunnel to a host it did not own,
+ * and then stopped that tunnel again on the way out — taking the running
+ * service's tunnel down with it. Refusing here is what keeps one instance from
+ * ever being mistaken for another.
+ */
+async function assertPortsFree(port: number, adminPort: number, cwd: string): Promise<void> {
+  const collisions: string[] = [];
+  if (await portInUse(port)) collisions.push(`MCP port ${port}`);
+  if (adminPort !== port && (await portInUse(adminPort))) collisions.push(`admin port ${adminPort}`);
+  if (!collisions.length) return;
+
+  const lines = [`${collisions.join(" and ")} already in use — chatgpt-local-coder is probably already running.`];
+
+  // Naming the service when it is the holder saves the operator a round of
+  // lsof; when it is not, the generic advice below still applies.
+  const status = await serviceStatus(defaultServiceSpec(cwd)).catch(() => undefined);
+  if (status?.running) {
+    lines.push(`The ${status.mechanism} service is running and owns those ports.`);
+    lines.push("To publish it to ChatGPT, connect a tunnel to it: `chatgpt-local-coder tunnel connect`.");
+  } else {
+    lines.push("Check what is running with `chatgpt-local-coder status`.");
   }
-  return false;
+  lines.push("To run a second instance on purpose, pass --port and --admin-port.");
+
+  throw new UsageError(lines.join("\n"));
 }
+
+export function tunnelRuntimeIsActive(status: TunnelCommandResult): boolean {
+  const state = status.json?.state?.toLowerCase();
+  return (
+    status.ok &&
+    (status.json?.process_running === true ||
+      status.json?.healthy === true ||
+      status.json?.ready === true ||
+      state === "running" ||
+      state === "starting")
+  );
+}
+
+/** Only this documented tunnel-client response proves that no alias exists. */
+export function tunnelRuntimeIsKnownAbsent(status: TunnelCommandResult): boolean {
+  if (status.ok) return false;
+  const detail = [status.stderr, status.stdout, status.error].filter(Boolean).join("\n");
+  return /alias .+ is not known; run create or connect first/i.test(detail);
+}
+
+export interface UpTunnelAttempt {
+  alreadyActive: boolean;
+  owned: boolean;
+  result?: ConnectResult;
+  statusError?: TunnelCommandResult;
+}
+
+/** Connect only when the configured alias is not already owned by another process. */
+export async function connectTunnelForUp(binary: string, plan: ConnectPlan): Promise<UpTunnelAttempt> {
+  const existing = await tunnelStatus({ binary }, plan.alias);
+  if (tunnelRuntimeIsActive(existing)) return { alreadyActive: true, owned: false };
+  if (!existing.ok && !tunnelRuntimeIsKnownAbsent(existing)) {
+    return { alreadyActive: false, owned: false, statusError: existing };
+  }
+
+  const result = await tunnelConnect({ binary }, plan);
+  return { alreadyActive: false, owned: result.ok, result };
+}
+
 
 export async function runUp(argv: string[], cwd = process.cwd()): Promise<number> {
   const parsed = parseCommand(argv, UP_SPEC);
@@ -101,12 +174,16 @@ export async function runUp(argv: string[], cwd = process.cwd()): Promise<number
   const { config } = loadConfig({ cwd, overrides: {} });
   const port = env.PORT ? Number.parseInt(env.PORT, 10) : config.port;
 
+  const adminPort = env.ADMIN_PORT ? Number.parseInt(env.ADMIN_PORT, 10) : config.adminPort;
+
   const entry = serverEntryPoint();
   try {
     await fs.access(entry);
   } catch {
     throw new UsageError(`server entry point is missing: ${entry}. Run \`npm run build\` first.`);
   }
+
+  await assertPortsFree(port, adminPort, cwd);
 
   const child: ChildProcess = spawn(process.execPath, [entry], { cwd, env, stdio: "inherit" });
 
@@ -149,7 +226,7 @@ export async function runUp(argv: string[], cwd = process.cwd()): Promise<number
   });
 
   if (!flag(parsed.values, "no-tunnel")) {
-    if (!(await waitForHealth(port))) {
+    if (!(await waitForServerHealth(port, 20_000, () => child.exitCode === null && !child.killed))) {
       console.error(`Server did not answer on 127.0.0.1:${port} — not connecting a tunnel.`);
     } else {
       const resolved = await resolveTunnelBinary({ binPath: config.tunnel.binPath, download: false });
@@ -159,11 +236,26 @@ export async function runUp(argv: string[], cwd = process.cwd()): Promise<number
         );
       } else {
         try {
-          const plan = await planConnect({ cwd });
+          const plan = await planConnect({ cwd, mcpUrl: `http://127.0.0.1:${port}/mcp` });
           await fs.mkdir(plan.profileDir, { recursive: true });
-          tunnelBinary = resolved.path;
-          tunnelAlias = plan.alias;
-          console.log(describeConnect(await tunnelConnect({ binary: resolved.path }, plan)));
+          const attempt = await connectTunnelForUp(resolved.path, plan);
+          if (attempt.statusError) {
+            console.error(
+              `Tunnel skipped: could not determine whether runtime alias "${plan.alias}" is already active; refusing to claim it.`
+            );
+            console.error("Run `chatgpt-local-coder tunnel status` and retry once its state is known.");
+          } else if (attempt.alreadyActive) {
+            console.error(
+              `Tunnel skipped: runtime alias "${plan.alias}" is already active; this foreground run will not claim or stop it.`
+            );
+            console.error("Use --no-tunnel for a deliberate second local instance.");
+          } else if (attempt.result) {
+            console.log(describeConnect(attempt.result));
+            if (attempt.owned) {
+              tunnelBinary = resolved.path;
+              tunnelAlias = plan.alias;
+            }
+          }
         } catch (error) {
           console.error(`Tunnel skipped: ${error instanceof Error ? error.message : String(error)}`);
           tunnelBinary = undefined;
@@ -246,8 +338,15 @@ export async function runStatus(argv: string[], cwd = process.cwd()): Promise<nu
         }
       : { running: false, port: config.port },
     tunnel: resolved.path
-      ? { binary: resolved.path, alias: config.tunnel.alias, healthy: tunnel?.json?.healthy ?? false, state: tunnel?.json?.state }
-      : { binary: null, alias: config.tunnel.alias, healthy: false },
+      ? {
+          binary: resolved.path,
+          alias: config.tunnel.alias,
+          processRunning: tunnel?.json?.process_running ?? false,
+          healthy: tunnel?.json?.healthy ?? false,
+          ready: tunnel?.json?.ready ?? false,
+          state: tunnel?.json?.state,
+        }
+      : { binary: null, alias: config.tunnel.alias, processRunning: false, healthy: false, ready: false },
     service: { mechanism: service.mechanism, installed: service.installed, running: service.running },
     stateDir: stateDir(),
     platform: platformId(),
@@ -265,7 +364,11 @@ export async function runStatus(argv: string[], cwd = process.cwd()): Promise<nu
   );
   console.log(
     resolved.path
-      ? `Tunnel:  alias ${config.tunnel.alias} — ${summary.tunnel.healthy ? "healthy" : tunnel?.json?.state ?? "not connected"}`
+      ? `Tunnel:  alias ${config.tunnel.alias} — ${
+          summary.tunnel.healthy
+            ? summary.tunnel.ready ? "healthy, ready" : "healthy, not ready"
+            : summary.tunnel.processRunning ? "running, unhealthy" : tunnel?.json?.state ?? "not connected"
+        }`
       : "Tunnel:  tunnel-client is not installed"
   );
   console.log(

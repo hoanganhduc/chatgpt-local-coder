@@ -91,11 +91,40 @@ export function startAdminServer(options: AdminServerOptions): Server {
     instructionsPreview: options.instructionsPreview,
   }));
 
-  return app.listen(options.port, host, () => {
+  const server = app.listen(options.port, host, () => {
     console.log(`  Admin UI:  ${announceAdminUrl(host, options.port)}`);
     if (adminTokenIsGenerated()) {
       console.log(`             (this run only — set ADMIN_TOKEN to keep one across restarts)`);
     }
     console.log(`  Admin API: http://${host}:${options.port}/health`);
   });
+
+  // The MCP listener has had this guard since the beginning; this one did not,
+  // so a taken admin port raised an unhandled 'error' event and the host died
+  // with a raw Node stack trace naming a port most operators never set. The
+  // most common cause is a second instance started while the service is already
+  // running, which the stack trace said nothing about.
+  //
+  // Exiting matches the MCP listener rather than degrading to a host with no
+  // admin UI: a half-started host that answers MCP but not /ui is harder to
+  // diagnose than one that refuses to start and says why.
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.error(`\n[ERROR] Admin port ${options.port} is already in use.`);
+      console.error("Most often this is a second instance: the host may already be running.");
+      console.error("  chatgpt-local-coder status");
+      console.error("Otherwise find the process that holds it:");
+      console.error(
+        process.platform === "win32"
+          ? `  netstat -ano | findstr ":${options.port}"`
+          : `  lsof -nP -iTCP:${options.port} -sTCP:LISTEN`
+      );
+      console.error("Then stop it, or start with a different ADMIN_PORT.\n");
+    } else {
+      console.error("\n[ERROR] Admin server failed to start:", err.message, "\n");
+    }
+    process.exit(1);
+  });
+
+  return server;
 }

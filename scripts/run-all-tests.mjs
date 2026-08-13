@@ -64,6 +64,7 @@ const unitScripts = [
   "scripts/test-delegates.mjs",
   "scripts/test-hooks.mjs",
   "scripts/test-tunnel.mjs",
+  "scripts/test-port-probe.mjs",
   "scripts/test-services.mjs",
   "scripts/test-cli.mjs",
   "scripts/test-patch.mjs",

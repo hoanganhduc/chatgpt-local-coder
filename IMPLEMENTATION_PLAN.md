@@ -37,7 +37,7 @@ These were chosen by the user and are not open for re-litigation.
 | Config sync | Live adapters | Source settings are read into a normalized runtime view at startup and on refresh. Source files are never modified. |
 | Shell safety | Approved host shell | File tools enforce workspace boundaries; every shell/skill execution is marked open-world and approval-required, and is documented as having host-user access. |
 | Secrets | Private files | App-owned files with mode `0600` (restricted DACL on Windows), plus environment overrides. |
-| Services | Server + tunnel | The MCP server installs as a native user service; tunnel lifecycle is delegated to official tunnel-client managed runtimes. |
+| Services | Server + tunnel | The MCP server installs as a native user service, and `--with-tunnel` adds a companion unit for the tunnel; supervision of the runtime itself stays with official tunnel-client managed runtimes. |
 
 ### 1.1 Platform boundary (must be stated honestly, never worked around)
 
@@ -517,12 +517,28 @@ logon in the user context, which matches the user-scoped model of the other two.
 This limitation is stated in the docs, not hidden.
 
 `service install` writes the unit, `service uninstall` removes it, and
-`service status` reports whether it is loaded and running. Tunnel lifecycle is
-**not** duplicated here — it is delegated to tunnel-client managed runtimes.
+`service status` reports whether it is loaded and running. Supervision of the
+tunnel runtime is **not** duplicated here — it stays with tunnel-client's
+managed runtimes.
+
+A `ServiceSpec` carries a `role`, and `--with-tunnel` installs a second unit for
+the `tunnel` role — `chatgpt-local-coder-tunnel.service`,
+`com.chatgpt-local-coder.tunnel`, `ChatGPTLocalCoderTunnel` — which starts and
+stops that managed runtime without supervising it. Choosing `--with-tunnel`
+explicitly transfers lifecycle responsibility for the configured alias to the
+companion, and the generated start/stop commands pin that alias so later config
+changes cannot redirect cleanup. Private ownership metadata preserves the
+installed spec across CLI invocations, and alias replacement requires an
+explicit uninstall before reinstall. Two units rather than one,
+because `connect` returns as soon as the runtime is healthy while the server
+runs indefinitely, and because a host restart must not drop the tunnel. The
+runtime is daemonized outside the unit's control group, so the spec also carries
+`stopArgs`: only `tunnel stop` can reach it.
 
 **Acceptance:** `scripts/test-services.mjs` asserts generated unit content for
-all three platforms (pure string generation, no installation) including correct
-absolute paths and environment.
+all three platforms and both roles (pure string generation, no installation),
+including correct absolute paths, environment, and that the tunnel plan's
+commands never name the host unit.
 
 ### T12 — CLI
 
@@ -534,7 +550,7 @@ compatibility.
 |---|---|
 | `init` | Interactive-free by default; writes `<configDir>/config.json`, prompts only with `--interactive`. Flags: `--workspace <path>` (repeatable), `--profile <workspace\|open\|readonly>`, `--port`, `--tunnel-alias`. |
 | `doctor` | Checks Node version, config validity, workspace roots exist, port availability, tunnel binary present, delegate CLIs, settings sources, skill roots, secrets set/unset. Exit 0 only when no `error`-level finding. Human table by default, `--json` for machines. |
-| `up` | Foreground. Starts the MCP server, and unless `--no-tunnel`, connects the tunnel runtime. Ctrl-C stops both. |
+| `up` | Foreground. Starts the MCP server, and unless `--no-tunnel`, connects the tunnel runtime. Ctrl-C stops only the tunnel it connected itself. Refuses to start when either port is taken; `--port` and `--admin-port` override both for a deliberate second instance, while an already-active configured tunnel alias is left untouched. |
 | `down` | Stops the tunnel runtime and any service-managed server. |
 | `status` | Server health, tunnel runtime status, session count. |
 | `secrets list\|set\|delete\|path` | T3 from the terminal. **Added during implementation:** T3 shipped a store with no way to fill it, and the alternative was telling people to hand-edit `secrets.json`, which loses the `0600`-before-content guarantee. `set` prompts with the input hidden and refuses a value passed as an argument, where `ps` and shell history would both catch it. |

@@ -336,9 +336,10 @@ later moment ever arrives.
 ## 4. Background service
 
 `chatgpt-local-coder service install` installs a **per-user** service. None of
-the three implementations needs elevation, and none of them manages the tunnel —
-run `chatgpt-local-coder tunnel connect` separately, or use `up`, which does both
-in the foreground.
+the three implementations needs elevation. By default only the host is
+installed, which runs the MCP server and publishes nothing: connect a tunnel to
+it with `chatgpt-local-coder tunnel connect`, or add `--with-tunnel` below to
+have one installed alongside it.
 
 | OS | Mechanism | Written to | Notes |
 |---|---|---|---|
@@ -348,6 +349,72 @@ in the foreground.
 
 `service status` reports the mechanism and the path, so you never have to guess
 which of the three you are on.
+
+The Linux unit deliberately carries no `After=network-online.target`. That
+target does not exist in the systemd **user** manager, so ordering against it is
+silently ignored — a line that reads like a guarantee and enforces nothing. The
+tunnel unit handles the boot race explicitly instead, below.
+
+### Bringing the tunnel back after a reboot
+
+```bash
+chatgpt-local-coder service install --with-tunnel     # both units
+chatgpt-local-coder service status --with-tunnel      # both, one line each
+chatgpt-local-coder service uninstall --with-tunnel   # tunnel first, then the host
+```
+
+`--with-tunnel` is an explicit ownership boundary: installing the companion
+transfers lifecycle responsibility for the configured alias to it and pins that
+alias in both the generated connect and stop commands. A later config change
+therefore cannot redirect cleanup to a different alias. Do not use that option
+for an alias managed independently. Uninstalling the companion may therefore
+run `tunnel stop` even when the wrapper has already disappeared.
+
+| OS | Tunnel mechanism | Written to |
+|---|---|---|
+| Linux | systemd user unit `chatgpt-local-coder-tunnel.service` | `~/.config/systemd/user/` |
+| macOS | LaunchAgent `com.chatgpt-local-coder.tunnel` | `~/Library/LaunchAgents/com.chatgpt-local-coder.tunnel.plist` |
+| Windows | `schtasks` logon task `ChatGPTLocalCoderTunnel` | `%LOCALAPPDATA%\chatgpt-local-coder\ChatGPTLocalCoderTunnel.xml` |
+
+Two units, not one, and each difference between them is forced by something
+real:
+
+- **The host restarts without taking the tunnel down.** The systemd unit depends
+  on the host with `Wants=`, not `Requires=`, so a host restart does not
+  propagate. One combined unit could not express this at all.
+- **`tunnel connect` returns; the runtime does not.** tunnel-client daemonizes
+  the runtime into its own session, outside the unit's control group. The
+  systemd unit is therefore `Type=oneshot` with `RemainAfterExit=yes` — without
+  it, systemd would read `connect` returning as the service ending.
+- **Stopping the unit cannot stop the runtime.** Nothing in the unit's process
+  tree owns it. The systemd unit carries an explicit
+  `ExecStop=… tunnel stop`, but systemd does not guarantee it after a failed
+  oneshot start; launchd and Task Scheduler have no equivalent. Therefore
+  `service uninstall --with-tunnel` removes the wrapper and then invokes
+  `tunnel stop` explicitly on every platform. Cleanup is best-effort: a failed wrapper
+  removal does not suppress the stop, and retained metadata makes a partial
+  uninstall retryable. If wrapper removal succeeds but the external stop fails,
+  a private `.uninstalling` marker lets the next uninstall finish cleanup and
+  remove both recovery files without trusting a now-missing wrapper query.
+  Systemd's `ExecStop` is deliberately prefixed with `-`: a redundant or failed
+  unit stop cannot prevent the CLI's later, independently checked alias stop.
+- **Ownership survives config changes.** A private `.owner.json` beside the unit
+  records the installed start/stop spec. Uninstall uses that record, not the
+  current `tunnel.alias`; an in-place alias change is refused until the existing
+  companion is uninstalled. This prevents an update from leaving the old alias
+  alive while later cleanup targets the new one.
+- **The boot race is resolved by retrying, not by ordering.** Every supervisor
+  considers the host unit started as soon as its process exists, which is well
+  before the server has bound its port — and a runtime that connects into that
+  gap reports itself healthy while separately recording that it never reached
+  the MCP host. The tunnel unit runs `tunnel connect --wait-for-server`, which
+  polls `/health` (60s by default, `--wait-timeout` to change it) and exits
+  non-zero rather than publishing a tunnel to nothing. `Restart=on-failure`,
+  launchd's `KeepAlive`, and Task Scheduler's `RestartOnFailure` each turn that
+  non-zero exit into a retry.
+
+Because the runtime lives outside the unit, systemd cannot observe it dying: the
+unit stays `active` regardless. `chatgpt-local-coder status` is the honest check.
 
 The Windows XML is written UTF-16LE with a BOM — `schtasks /Create /XML` rejects
 anything else — and it is the input to the task, not the task itself. Deleting
@@ -378,7 +445,9 @@ cannot reliably prove absence, so automatic binary cleanup could break a task
 that still exists. A failed uninstall keeps the XML and support files so the
 operation can be retried. On systemd and launchd, a later command failure keeps
 the attempted definition because the manager may already have loaded it.
-Command sequences stop on their first failure.
+Install command sequences stop on their first failure; tunnel uninstall
+still attempts its independent runtime cleanup after a wrapper-manager
+failure.
 
 Before replacing, stopping, or deleting the fixed-name task, the host queries
 its XML and checks the action, principal, run level, visibility, working
@@ -394,10 +463,14 @@ or hybrid definitions are never treated as owned.
 ```bash
 chatgpt-local-coder service install --dry-run              # this machine, prints only
 chatgpt-local-coder service install --platform win32 --dry-run
+chatgpt-local-coder service install --with-tunnel --dry-run --platform darwin
 ```
 
 `--dry-run` prints the generated unit and the commands that would install it,
-and writes nothing.
+and writes nothing. With `--with-tunnel` it prints both units, host first.
+
+`--json` returns a single object for one unit and an array for two, so a caller
+that never passes `--with-tunnel` parses exactly what it always did.
 
 **`--platform` alone is not a preview flag.** It implies `--dry-run` only when
 the platform you name differs from the one you are on, so

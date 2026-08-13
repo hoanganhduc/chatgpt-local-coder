@@ -229,8 +229,26 @@ Chạy nền thay vì foreground:
 
 ```bash
 chatgpt-local-coder service install    # systemd user unit / LaunchAgent / schtasks
-chatgpt-local-coder tunnel connect     # service không quản tunnel
+chatgpt-local-coder tunnel connect     # unit host không tự publish tunnel
 ```
+
+Muốn tunnel tự lên lại sau khi khởi động lại máy, cài thêm unit đi kèm:
+
+```bash
+chatgpt-local-coder service install --with-tunnel   # host + tunnel
+chatgpt-local-coder service status --with-tunnel
+```
+
+`--with-tunnel` transfers lifecycle responsibility for the configured alias to
+the companion service and pins that alias in the generated unit. Do not use it
+for an independently managed alias; uninstalling the companion explicitly runs
+`tunnel stop` for the pinned alias.
+Muốn chuyển companion sang alias khác thì uninstall trước; host từ chối thay
+alias tại chỗ để không bỏ lại runtime cũ.
+
+Hai unit tách rời để restart host không kéo tunnel xuống theo. Unit tunnel chạy
+`tunnel connect --wait-for-server`, nên nếu boot xong trước khi server bind port
+thì nó thử lại thay vì publish một tunnel không trỏ vào đâu.
 
 **Lần đầu dùng tunnel:** `chatgpt-local-coder tunnel init` — tải và verify
 `tunnel-client`, tạo alias. Lấy credential ở

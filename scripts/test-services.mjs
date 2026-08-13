@@ -17,6 +17,7 @@ import {
   LABEL,
   isOwnedWindowsTask,
   installService,
+  launchdLabel,
   launchdPlistPath,
   renderLaunchAgent,
   renderSystemdUnit,
@@ -24,12 +25,17 @@ import {
   renderWindowsPowerShellPredecessorTaskXml,
   servicePlan,
   stopService,
+  systemdUnitName,
   systemdUnitPath,
   TASK_NAME,
   TASK_OWNERSHIP_MARKER,
   taskXmlPath,
+  TUNNEL_LABEL,
+  TUNNEL_TASK_NAME,
+  TUNNEL_UNIT_NAME,
   UNIT_NAME,
   uninstallService,
+  windowsTaskName,
   rotateServerLog,
   WINDOWS_LAUNCHER_SOURCE,
   windowsLauncherCompileCommand,
@@ -140,6 +146,18 @@ const spec = {
   env: { CLC_CONFIG_DIR: path.join(tmp, "config"), NODE_ENV: "production" },
 };
 
+// The companion spec. `stopArgs` is not decoration: tunnel-client daemonizes the
+// runtime out of the unit's process tree, so stopping the unit cannot reach it.
+const TUNNEL_LOG = path.join(tmp, "state", "tunnel.log");
+const tunnelSpec = {
+  ...spec,
+  role: "tunnel",
+  args: [ENTRY, "tunnel", "connect", "--wait-for-server"],
+  stopArgs: [ENTRY, "tunnel", "stop"],
+  description: "chatgpt-local-coder tunnel runtime",
+  logPath: TUNNEL_LOG,
+};
+
 const nativeLauncherHome = path.join(tmp, "native-launcher-home");
 async function compileNativeLauncherFixture() {
   const source = windowsLauncherSourcePath(nativeLauncherHome);
@@ -212,6 +230,14 @@ check("the systemd unit carries absolute paths, the environment, and the log", (
   includes(unit, "Restart=on-failure", "restart policy");
   includes(unit, "WantedBy=default.target", "install target");
   assert(!/WantedBy=multi-user\.target/.test(unit), "a user unit must not target multi-user");
+});
+
+check("the systemd unit does not order against network-online.target", () => {
+  // That target does not exist in the user manager. Ordering against it is
+  // silently ignored, so the line reads as a guarantee that nothing enforces.
+  const unit = renderSystemdUnit(spec);
+  assert(!/^After=network-online\.target/m.test(unit), "network-online.target is a no-op for user units");
+  assert(!/^Wants=network-online\.target/m.test(unit), "and pulling it in cannot work either");
 });
 
 check("systemd quoting survives spaces in argv and quotes in the environment", () => {
@@ -535,7 +561,7 @@ check("every platform yields absolute paths and a distinct mechanism", () => {
   assert(mechanisms.size === 3, `each platform needs its own mechanism: ${[...mechanisms].join(", ")}`);
 });
 
-check("no plan mentions the tunnel: that lifecycle belongs to tunnel-client", () => {
+check("the host plan never connects a tunnel: that is the companion unit's job", () => {
   for (const platform of ["linux", "darwin", "win32"]) {
     const plan = servicePlan(spec, platform, home);
     const launchContent = platform === "win32" ? nativeTaskPayload(plan.content).argumentLine : plan.content;
@@ -545,6 +571,306 @@ check("no plan mentions the tunnel: that lifecycle belongs to tunnel-client", ()
       .join("\n");
     assert(!/tunnel-client/.test(commands), `${platform}: a service must not drive tunnel-client`);
   }
+});
+
+// ------------------------------------------------------------- tunnel role
+// The companion unit exists so that restarting the host does not drop the
+// tunnel with it. Everything below is about keeping the two genuinely separate.
+
+check("the tunnel role gets its own unit, label, and task on every platform", () => {
+  assert(systemdUnitName("tunnel") === TUNNEL_UNIT_NAME, "systemd unit name");
+  assert(launchdLabel("tunnel") === TUNNEL_LABEL, "launchd label");
+  assert(windowsTaskName("tunnel") === TUNNEL_TASK_NAME, "windows task name");
+  assert(systemdUnitName() === UNIT_NAME, "the default role is still the host");
+  assert(launchdLabel() === LABEL, "the default role is still the host");
+  assert(windowsTaskName() === TASK_NAME, "the default role is still the host");
+
+  for (const platform of ["linux", "darwin", "win32"]) {
+    const host = servicePlan(spec, platform, home);
+    const tunnel = servicePlan(tunnelSpec, platform, home);
+    assert(tunnel.unitPath !== host.unitPath, `${platform}: the two units would overwrite each other`);
+    assert(tunnel.mechanism === host.mechanism, `${platform}: both roles use the same mechanism`);
+    const launchContent = platform === "win32" ? taskPayload(tunnel.content).argumentLine : tunnel.content;
+    for (const token of ["tunnel", "connect", "--wait-for-server"]) {
+      includes(launchContent, token, `${platform}: connect argv`);
+    }
+    assert(!launchContent.includes("--no-tunnel"), `${platform}: the tunnel unit must not start a server`);
+  }
+});
+
+check("the tunnel plan's commands only ever name the tunnel unit", () => {
+  for (const platform of ["linux", "darwin", "win32"]) {
+    const plan = servicePlan(tunnelSpec, platform, home);
+    const commands = [...plan.installCommands, ...plan.uninstallCommands, ...plan.stopCommands, plan.statusCommand]
+      .map(([c, a]) => `${c} ${a.join(" ")}`)
+      .join("\n");
+    // `chatgpt-local-coder.service` is a prefix of the tunnel unit's own name,
+    // so the host is only named if it appears without the `-tunnel` infix.
+    assert(
+      !new RegExp(`${UNIT_NAME}(?![-\\w])`).test(commands.replace(new RegExp(TUNNEL_UNIT_NAME, "g"), "")),
+      `${platform}: uninstalling the tunnel must not touch the host: ${commands}`
+    );
+  }
+});
+
+check("the systemd tunnel unit survives ExecStart returning and stops its managed alias", () => {
+  const unit = renderSystemdUnit(tunnelSpec);
+  // `connect` returns as soon as the runtime reports healthy. Without oneshot +
+  // RemainAfterExit, systemd would treat that return as the service ending.
+  includes(unit, "Type=oneshot", "service type");
+  includes(unit, "RemainAfterExit=yes", "remain after exit");
+  includes(unit, `ExecStart=${NODE} ${ENTRY} tunnel connect --wait-for-server`, "ExecStart");
+  includes(unit, `ExecStop=-${NODE} ${ENTRY} tunnel stop`, "best-effort ExecStop");
+  includes(unit, `After=${UNIT_NAME}`, "ordering after the host");
+  // Wants=, not Requires=: a host restart must not take the tunnel with it.
+  includes(unit, `Wants=${UNIT_NAME}`, "a weak dependency on the host");
+  assert(!new RegExp(`Requires=${UNIT_NAME}`).test(unit), "Requires= would propagate host restarts");
+  // `connect` exits non-zero while the runtime is unhealthy, so on-failure is
+  // what retries past a boot that comes up before the network does.
+  includes(unit, "Restart=on-failure", "retry until healthy");
+  includes(unit, `StandardOutput=append:${TUNNEL_LOG}`, "its own log, not the host's");
+});
+
+check("a spec with no stopArgs renders no ExecStop", () => {
+  const unit = renderSystemdUnit({ ...tunnelSpec, stopArgs: undefined });
+  assert(!/ExecStop=/.test(unit), "an empty ExecStop line would fail to parse");
+});
+
+check("the tunnel plans warn that stopping the unit does not stop the runtime", () => {
+  for (const platform of ["linux", "darwin", "win32"]) {
+    const plan = servicePlan(tunnelSpec, platform, home);
+    assert(
+      plan.notes.some((n) => /tunnel stop|control group/.test(n)),
+      `${platform}: the runtime outlives the unit, and the notes should say so: ${JSON.stringify(plan.notes)}`
+    );
+    assert(
+      !servicePlan(spec, platform, home).notes.some((n) => /tunnel stop/.test(n)),
+      `${platform}: the host plan has no business mentioning the tunnel`
+    );
+  }
+});
+
+check("the LaunchAgent label follows the role", () => {
+  const plist = renderLaunchAgent(tunnelSpec);
+  const argv = [...plist.matchAll(/<string>([^<]*)<\/string>/g)].map((m) => m[1]);
+  assert(argv[0] === TUNNEL_LABEL, `the tunnel agent needs its own label: ${argv[0]}`);
+  assert(launchdPlistPath(home, "tunnel").endsWith(`${TUNNEL_LABEL}.plist`), "plist path follows the label");
+});
+
+check("the Windows tunnel task is a separate task name and XML file", () => {
+  const plan = servicePlan(tunnelSpec, "win32", home);
+  assert(plan.unitPath === taskXmlPath(home, "tunnel"), "the plan and the helper must agree");
+  const [command, args] = plan.installCommands[0];
+  assert(path.win32.basename(command).toLowerCase() === "schtasks.exe", `unexpected command: ${command}`);
+  assert(args[args.indexOf("/TN") + 1] === TUNNEL_TASK_NAME, "install task name");
+
+  const [, queryArgs] = windowsTaskQueryCommand("tunnel");
+  assert(queryArgs[queryArgs.indexOf("/TN") + 1] === TUNNEL_TASK_NAME, "ownership query task name");
+});
+
+await checkAsync("Windows tunnel ownership failures name and preserve the tunnel task", async () => {
+  const fakeHome = path.join(tmp, "tunnel-collision-home");
+  const unit = taskXmlPath(fakeHome, "tunnel");
+  await fs.mkdir(path.dirname(unit), { recursive: true });
+  await fs.writeFile(unit, "tunnel recovery metadata", "utf-8");
+  let queryArgs;
+  const runner = async (_command, args) => {
+    queryArgs = args;
+    return commandRun({ stdout: "<Task><Description>someone else's task</Description></Task>" });
+  };
+
+  const result = await installService(tunnelSpec, "win32", { home: fakeHome, runner });
+  assert(queryArgs[queryArgs.indexOf("/TN") + 1] === TUNNEL_TASK_NAME, "ownership probe queried the host task");
+  assert(result.commandResults.length === 1, "a mutating command ran after the ownership failure");
+  assert(result.commandResults[0].stderr.includes(TUNNEL_TASK_NAME), result.commandResults[0].stderr);
+  assert(result.metadataPresent === true, "tunnel recovery metadata was lost");
+  assert((await fs.readFile(unit, "utf-8")) === "tunnel recovery metadata", "tunnel metadata changed");
+});
+
+await checkAsync("every tunnel uninstall explicitly stops the external runtime after removing its wrapper", async () => {
+  for (const platform of ["linux", "darwin", "win32"]) {
+    const fakeHome = path.join(tmp, `${platform}-tunnel-uninstall-home`);
+    const unit = servicePlan(tunnelSpec, platform, fakeHome).unitPath;
+    await fs.mkdir(path.dirname(unit), { recursive: true });
+    await fs.writeFile(unit, "tunnel recovery metadata", "utf-8");
+
+    const calls = [];
+    const runner = async (command, args) => {
+      calls.push([command, args]);
+      if (platform === "win32" && args.includes("/Query")) {
+        return commandRun({ stdout: renderTaskXml(tunnelSpec) });
+      }
+      return commandRun();
+    };
+
+    const result = await uninstallService(tunnelSpec, platform, { home: fakeHome, runner });
+    assert(result.commandResults.every((entry) => entry.exitCode === 0), `${platform}: uninstall failed`);
+    const stopIndex = calls.findIndex(([command, args]) => command === NODE && args.includes("stop"));
+    const wrapperIndex = calls.findIndex(([, args]) =>
+      args.includes("disable") || args.includes("bootout") || args.includes("/Delete")
+    );
+    assert(wrapperIndex >= 0 && stopIndex > wrapperIndex, `${platform}: wrapper was not removed before tunnel stop`);
+    if (platform === "win32") {
+      const deleteArgs = calls[wrapperIndex][1];
+      assert(deleteArgs[deleteArgs.indexOf("/TN") + 1] === TUNNEL_TASK_NAME, "deleted the host task");
+    }
+    assert(result.metadataPresent === false, `${platform}: successful uninstall left metadata behind`);
+  }
+});
+
+await checkAsync("tunnel uninstall retries still stop the external runtime after wrapper removal", async () => {
+  for (const platform of ["linux", "darwin", "win32"]) {
+    const fakeHome = path.join(tmp, `${platform}-tunnel-uninstall-retry-home`);
+    const unit = servicePlan(tunnelSpec, platform, fakeHome).unitPath;
+    await fs.mkdir(path.dirname(unit), { recursive: true });
+    await fs.writeFile(unit, "tunnel recovery metadata", "utf-8");
+
+    let wrapperExists = true;
+    let runtimeRunning = true;
+    const firstRunner = async (_command, args) => {
+      if (platform === "win32" && args.includes("/Query")) {
+        return commandRun({ stdout: renderTaskXml(tunnelSpec) });
+      }
+      if (args.includes("disable") || args.includes("bootout") || args.includes("/Delete")) {
+        wrapperExists = false;
+        return commandRun();
+      }
+      if (args.includes("stop")) return commandRun({ exitCode: 1, stderr: "runtime stop failed" });
+      return commandRun();
+    };
+
+    const first = await uninstallService(tunnelSpec, platform, { home: fakeHome, runner: firstRunner });
+    assert(wrapperExists === false, `${platform}: first attempt did not remove the wrapper`);
+    assert(first.metadataPresent === true, `${platform}: failed stop discarded retry metadata`);
+    await fs.access(`${unit}.uninstalling`);
+
+    let stopRetried = false;
+    const retryRunner = async (_command, args) => {
+      if (platform === "win32" && args.includes("/Query")) {
+        return commandRun({ exitCode: 1, stderr: "task not found" });
+      }
+      if (args.includes("bootout")) return commandRun({ exitCode: 1, stderr: "agent not loaded" });
+      if (args.includes("stop")) {
+        stopRetried = true;
+        runtimeRunning = false;
+      }
+      return commandRun();
+    };
+
+    const retry = await uninstallService(tunnelSpec, platform, { home: fakeHome, runner: retryRunner });
+    assert(stopRetried && runtimeRunning === false, `${platform}: retry did not stop the external runtime`);
+    assert(retry.commandResults.every((entry) => entry.exitCode === 0), `${platform}: retry did not converge`);
+    assert(retry.metadataPresent === false, `${platform}: successful retry retained recovery metadata`);
+    await fs.access(`${unit}.uninstalling`).then(
+      () => { throw new Error(`${platform}: successful retry retained its cleanup marker`); },
+      () => undefined
+    );
+  }
+});
+
+await checkAsync("installed ownership metadata pins tunnel cleanup across config changes", async () => {
+  const aliasA = "service-owned-a";
+  const aliasB = "later-config-b";
+  const specA = {
+    ...tunnelSpec,
+    args: [ENTRY, "tunnel", "connect", "--alias", aliasA, "--wait-for-server"],
+    stopArgs: [ENTRY, "tunnel", "stop", "--alias", aliasA],
+  };
+  const specB = {
+    ...tunnelSpec,
+    args: [ENTRY, "tunnel", "connect", "--alias", aliasB, "--wait-for-server"],
+    stopArgs: [ENTRY, "tunnel", "stop", "--alias", aliasB],
+  };
+
+  for (const platform of ["linux", "darwin", "win32"]) {
+    const fakeHome = path.join(tmp, `${platform}-pinned-alias-home`);
+    const plan = servicePlan(specA, platform, fakeHome);
+    const installRunner = async (_command, args) => {
+      if (platform === "win32" && args.includes("/Query")) {
+        return commandRun({ exitCode: 1, stderr: "task not found" });
+      }
+      return commandRun();
+    };
+    const installed = await installService(specA, platform, { home: fakeHome, runner: installRunner });
+    assert(installed.commandResults.every((entry) => entry.exitCode === 0), `${platform}: install failed`);
+    await fs.access(`${plan.unitPath}.owner.json`);
+
+    let stoppedArgs;
+    const uninstallRunner = async (_command, args) => {
+      if (platform === "win32" && args.includes("/Query")) {
+        return commandRun({ stdout: renderTaskXml(specA) });
+      }
+      if (args.includes("stop")) stoppedArgs = args;
+      return commandRun();
+    };
+    const uninstalled = await uninstallService(specB, platform, { home: fakeHome, runner: uninstallRunner });
+    assert(uninstalled.commandResults.every((entry) => entry.exitCode === 0), `${platform}: uninstall failed`);
+    assert(stoppedArgs?.includes(aliasA), `${platform}: cleanup did not use the installed alias`);
+    assert(!stoppedArgs?.includes(aliasB), `${platform}: later config redirected cleanup`);
+    assert(uninstalled.metadataPresent === false, `${platform}: successful cleanup retained ownership metadata`);
+  }
+});
+
+await checkAsync("companion reinstall cannot replace an owned alias or interrupt pending cleanup", async () => {
+  const fakeHome = path.join(tmp, "companion-reinstall-guard-home");
+  const aliasA = "installed-alias";
+  const aliasB = "replacement-alias";
+  const specA = {
+    ...tunnelSpec,
+    args: [ENTRY, "tunnel", "connect", "--alias", aliasA, "--wait-for-server"],
+    stopArgs: [ENTRY, "tunnel", "stop", "--alias", aliasA],
+  };
+  const specB = {
+    ...tunnelSpec,
+    args: [ENTRY, "tunnel", "connect", "--alias", aliasB, "--wait-for-server"],
+    stopArgs: [ENTRY, "tunnel", "stop", "--alias", aliasB],
+  };
+  const plan = servicePlan(specA, "linux", fakeHome);
+  await installService(specA, "linux", { home: fakeHome, runner: async () => commandRun() });
+
+  let calls = 0;
+  let driftRejected = false;
+  try {
+    await installService(specB, "linux", {
+      home: fakeHome,
+      runner: async () => { calls++; return commandRun(); },
+    });
+  } catch (error) {
+    driftRejected = /uninstall the existing companion first/.test(String(error));
+  }
+  assert(driftRejected && calls === 0, "alias drift reached the service manager");
+  assert((await fs.readFile(`${plan.unitPath}.owner.json`, "utf-8")).includes(aliasA), "owned alias metadata changed");
+
+  const failedStopRunner = async (_command, args) =>
+    args.includes("stop") ? commandRun({ exitCode: 1, stderr: "stop failed" }) : commandRun();
+  await uninstallService(specA, "linux", { home: fakeHome, runner: failedStopRunner });
+  await fs.access(`${plan.unitPath}.uninstalling`);
+
+  let pendingRejected = false;
+  try {
+    await installService(specA, "linux", { home: fakeHome, runner: async () => commandRun() });
+  } catch (error) {
+    pendingRejected = /cleanup is pending/.test(String(error));
+  }
+  assert(pendingRejected, "a reinstall discarded the pending-cleanup marker");
+  await fs.access(`${plan.unitPath}.uninstalling`);
+});
+
+await checkAsync("Windows stopService targets the owned tunnel task, never the host task", async () => {
+  const fakeHome = path.join(tmp, "tunnel-stop-home");
+  const unit = taskXmlPath(fakeHome, "tunnel");
+  await fs.mkdir(path.dirname(unit), { recursive: true });
+  await fs.writeFile(unit, "tunnel metadata", "utf-8");
+  let endArgs;
+  const runner = async (_command, args) => {
+    if (args.includes("/Query")) return commandRun({ stdout: renderTaskXml(tunnelSpec) });
+    if (args.includes("/End")) endArgs = args;
+    return commandRun();
+  };
+
+  const result = await stopService(tunnelSpec, "win32", { home: fakeHome, runner });
+  assert(result.commandResults.every((entry) => entry.exitCode === 0), "tunnel task stop failed");
+  assert(endArgs?.[endArgs.indexOf("/TN") + 1] === TUNNEL_TASK_NAME, "stopped the host task");
 });
 
 await checkAsync("generating a plan writes nothing to disk", async () => {

@@ -122,7 +122,9 @@ export function buildRemoveArgs(alias: string): string[] {
 }
 
 export interface RuntimeJson {
+  process_running?: boolean;
   healthy?: boolean;
+  ready?: boolean;
   health_url?: string;
   config_path?: string;
   tunnel_id?: string;

@@ -9,12 +9,17 @@
 import os from "os";
 import path from "path";
 
-import type { ServicePlan, ServiceSpec } from "./types.js";
+import type { ServicePlan, ServiceSpec, ServiceRole } from "./types.js";
 
 export const LABEL = "com.chatgpt-local-coder";
+export const TUNNEL_LABEL = "com.chatgpt-local-coder.tunnel";
 
-export function launchdPlistPath(home: string = os.homedir()): string {
-  return path.join(home, "Library", "LaunchAgents", `${LABEL}.plist`);
+export function launchdLabel(role: ServiceRole = "host"): string {
+  return role === "tunnel" ? TUNNEL_LABEL : LABEL;
+}
+
+export function launchdPlistPath(home: string = os.homedir(), role: ServiceRole = "host"): string {
+  return path.join(home, "Library", "LaunchAgents", `${launchdLabel(role)}.plist`);
 }
 
 /** Escape the five characters XML 1.0 reserves. */
@@ -38,7 +43,7 @@ export function renderLaunchAgent(spec: ServiceSpec): string {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${LABEL}</string>
+  <string>${launchdLabel(spec.role)}</string>
   <key>ProgramArguments</key>
   <array>
 ${argv}
@@ -66,8 +71,9 @@ ${env}
 }
 
 export function launchdPlan(spec: ServiceSpec, home: string = os.homedir()): ServicePlan {
-  const plistPath = launchdPlistPath(home);
-  const target = `gui/${process.getuid?.() ?? 501}/${LABEL}`;
+  const role = spec.role ?? "host";
+  const plistPath = launchdPlistPath(home, role);
+  const target = `gui/${process.getuid?.() ?? 501}/${launchdLabel(role)}`;
 
   return {
     mechanism: "launchd-agent",
@@ -82,6 +88,15 @@ export function launchdPlan(spec: ServiceSpec, home: string = os.homedir()): Ser
     statusCommand: ["launchctl", ["print", target]],
     notes: [
       "`launchctl bootstrap` replaces the deprecated `load`; on older macOS use `launchctl load -w <plist>`.",
+      ...(role === "tunnel"
+        ? [
+            // KeepAlive{SuccessfulExit:false} already means "retry until it
+            // exits 0", which is exactly the retry-until-healthy the boot race
+            // needs, since `connect` exits non-zero while unhealthy.
+            "`connect` exits non-zero until the runtime is healthy, and KeepAlive retries it until it succeeds.",
+            "A LaunchAgent has no ExecStop, so uninstall unloads the agent before explicitly running `tunnel stop`.",
+          ]
+        : []),
     ],
   };
 }

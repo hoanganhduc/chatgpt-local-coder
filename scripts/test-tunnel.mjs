@@ -195,20 +195,28 @@ const argv = [path.basename(process.argv[1]), ...process.argv.slice(2)];
 fs.appendFileSync(process.env.CLC_STUB_LOG, JSON.stringify(argv) + "\\n");
 
 const mode = process.env.CLC_STUB_MODE || "healthy";
-const healthy = mode === "healthy";
 const sub = argv[1];
+const healthy = mode === "healthy" || ((mode === "missing" || mode === "ambiguous") && sub === "connect");
+const processRunning = mode === "healthy" || mode === "active-unhealthy" || ((mode === "missing" || mode === "ambiguous") && sub === "connect");
 const body = { alias: argv.includes("--alias") ? argv[argv.indexOf("--alias") + 1] : argv[2] };
 
 if (sub === "connect" || sub === "status") {
+  body.process_running = processRunning;
   body.healthy = healthy;
-  body.state = healthy ? "running" : "starting";
+  body.ready = healthy;
   body.health_url = "http://127.0.0.1:9999/health";
   body.config_path = path.join(process.env.CLC_STUB_DIR, "runtime-config.json");
   if (!healthy) body.launch_diagnostics = { log_path: process.env.CLC_STUB_LOGFILE };
 }
 
-if (mode === "fail") {
-  process.stderr.write("stub: connect refused\\n");
+if ((mode === "fail" && sub === "connect") || ((mode === "missing" || mode === "ambiguous") && sub === "status")) {
+  process.stderr.write(
+    mode === "missing"
+      ? "alias acceptance is not known; run create or connect first\\n"
+      : mode === "ambiguous"
+        ? "status request timed out\\n"
+        : "stub: connect refused\\n"
+  );
   console.log(JSON.stringify(body));
   process.exit(3);
 }
@@ -274,6 +282,43 @@ async function recordedArgv() {
 
 // `binary` is the Node executable; the stub is what actually answers.
 const stubOpts = { binary: process.execPath, timeoutMs: 20_000 };
+const { connectTunnelForUp } = await import("../dist/cli/commands/serve.js");
+
+const upPlan = {
+  alias: "acceptance",
+  profile: "acceptance",
+  profileDir: path.join(tmp, "profiles"),
+  mcpServerUrl: "http://127.0.0.1:3000/mcp",
+  runtimeApiKey: `file:${secretFile}`,
+};
+
+await checkAsync("up never claims an already-active tunnel alias", async () => {
+  // The official client reports process_running separately from health. An
+  // active but currently unhealthy runtime is still somebody else's process.
+  const attempt = await withStub("active-unhealthy", () => connectTunnelForUp(process.execPath, upPlan));
+  assert(attempt.alreadyActive === true && attempt.owned === false, JSON.stringify(attempt));
+  const argvs = await recordedArgv();
+  assert(argvs.length === 1 && argvs[0][1] === "status", `unexpected calls: ${JSON.stringify(argvs)}`);
+});
+
+await checkAsync("up owns only a tunnel connection that it established successfully", async () => {
+  const connected = await withStub("missing", () => connectTunnelForUp(process.execPath, upPlan));
+  assert(connected.alreadyActive === false && connected.owned === true, JSON.stringify(connected));
+  let argvs = await recordedArgv();
+  assert(argvs.length === 2 && argvs[0][1] === "status" && argvs[1][1] === "connect", JSON.stringify(argvs));
+
+  const failed = await withStub("fail", () => connectTunnelForUp(process.execPath, upPlan));
+  assert(failed.alreadyActive === false && failed.owned === false, JSON.stringify(failed));
+  argvs = await recordedArgv();
+  assert(argvs.length === 2 && argvs[1][1] === "connect", JSON.stringify(argvs));
+});
+
+await checkAsync("up fails closed when tunnel status is inconclusive", async () => {
+  const attempt = await withStub("ambiguous", () => connectTunnelForUp(process.execPath, upPlan));
+  assert(attempt.alreadyActive === false && attempt.owned === false && attempt.statusError, JSON.stringify(attempt));
+  const argvs = await recordedArgv();
+  assert(argvs.length === 1 && argvs[0][1] === "status", `an ambiguous probe reached connect: ${JSON.stringify(argvs)}`);
+});
 
 await checkAsync("the stub receives the exact create argv", async () => {
   const result = await withStub("healthy", () => tunnelCreate(stubOpts, { alias: "acceptance" }));

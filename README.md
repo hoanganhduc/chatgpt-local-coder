@@ -80,7 +80,11 @@ bin directory at all, every command below also works as
 - `config path` prints the resolved config, state and cache directories.
   `doctor` names only the config file.
 - `up` runs the server in the foreground and connects the tunnel unless you pass
-  `--no-tunnel`.
+  `--no-tunnel`. It refuses to start over a host that is already running rather
+  than colliding on the port — to run a second instance deliberately, give it
+  both `--port` and `--admin-port`. If the configured tunnel alias already
+  belongs to the first instance, also pass `--no-tunnel`; `up` will never claim
+  or stop an alias it finds active.
 
 Health check: `http://127.0.0.1:3000/health`.
 
@@ -121,8 +125,26 @@ variable, and `--real-system` for writes to a real home directory. Check it with
 ```bash
 chatgpt-local-coder service install     # systemd user unit / LaunchAgent / schtasks logon task
 chatgpt-local-coder service status
-chatgpt-local-coder tunnel connect      # the service does not manage the tunnel
+chatgpt-local-coder tunnel connect      # the host unit alone does not publish anything
 ```
+
+To have the tunnel come back on its own after a reboot, install its companion
+unit as well:
+
+```bash
+chatgpt-local-coder service install --with-tunnel   # host unit + tunnel unit
+chatgpt-local-coder service status --with-tunnel    # reports both
+```
+
+They are two units rather than one because restarting the host would otherwise
+drop the tunnel with it. The tunnel unit runs `tunnel connect --wait-for-server`,
+so a boot that reaches it before the server has bound its port retries instead of
+publishing a tunnel to nothing. Installing with `--with-tunnel` transfers
+lifecycle responsibility for the configured alias to that companion and pins
+that alias in the generated unit: do not use
+it for an alias managed independently, and uninstalling it runs `tunnel stop`.
+To transfer the companion to another alias, uninstall it first; an in-place
+alias replacement is refused so the previously owned runtime cannot be orphaned.
 
 No elevation is required on any of the three platforms. See
 [docs/cross-platform.md](docs/cross-platform.md#4-background-service) for what
@@ -504,6 +526,8 @@ network except `npm ci`.
 | **A tool is denied and names an imported rule** | A `permissions.deny` entry in another agent's settings matched. Remove it there, or set `settings.import` to `false`. |
 | **Resource not found** on a tool call | Refresh the connector and start a new chat. Sessions auto-recover; make sure the latest build is running. |
 | **Connection failed** | `chatgpt-local-coder status` — server and tunnel must both be up, and the URL must be HTTPS. |
+| **`up` says a port is already in use** | Something is already listening — usually the installed service. Publish that one with `chatgpt-local-coder tunnel connect` instead of starting a second host. To run two locally, give the second `--port`, `--admin-port`, and `--no-tunnel`. |
+| **`up` says the tunnel alias is already active** | The alias belongs to another process, so this foreground run will not claim or later stop it. Use `--no-tunnel` for the second local instance. |
 | **Permission popup on every call** | Settings → Apps → set the connector to *Ask before important changes*. Do not use the popup's "Always allow". |
 | **Tool blocked by OpenAI safety** | Not a server bug. Retry via `run_command`; responses may include a `run_command_fallback`. Affects `git_push`, `git_checkout`, `delete_directory` occasionally. |
 | **`stream canceled` in the tunnel log** | Server or tunnel restarted mid-session. Refresh the connector, new chat. |

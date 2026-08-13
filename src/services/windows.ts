@@ -14,14 +14,19 @@ import os from "os";
 import path from "path";
 
 import { isWindowsBatchTarget, windowsSystemTool } from "../lib/platform.js";
-import type { ServiceCommand, ServicePlan, ServiceSpec } from "./types.js";
+import type { ServiceCommand, ServicePlan, ServiceRole, ServiceSpec } from "./types.js";
 import { WINDOWS_LAUNCHER_BASENAME, WINDOWS_LAUNCHER_SOURCE_SHA256 } from "./windows-launcher.js";
 
 export const TASK_NAME = "ChatGPTLocalCoder";
 export const TASK_OWNERSHIP_MARKER = "Managed by chatgpt-local-coder (task schema v1)";
+export const TUNNEL_TASK_NAME = "ChatGPTLocalCoderTunnel";
 
-export function taskXmlPath(home: string = os.homedir()): string {
-  return path.join(home, "AppData", "Local", "chatgpt-local-coder", `${TASK_NAME}.xml`);
+export function windowsTaskName(role: ServiceRole = "host"): string {
+  return role === "tunnel" ? TUNNEL_TASK_NAME : TASK_NAME;
+}
+
+export function taskXmlPath(home: string = os.homedir(), role: ServiceRole = "host"): string {
+  return path.join(home, "AppData", "Local", "chatgpt-local-coder", `${windowsTaskName(role)}.xml`);
 }
 
 export function windowsLauncherSourcePath(home: string = os.homedir()): string {
@@ -354,9 +359,16 @@ export function windowsLauncherCompileCommand(
   ];
 }
 
-/** Query the registered definition before replacing or deleting a fixed-name task. */
-export function windowsTaskQueryCommand(env: NodeJS.ProcessEnv = process.env): ServiceCommand {
-  return [windowsSystemTool("schtasks.exe", env), ["/Query", "/TN", TASK_NAME, "/XML"]];
+/** Query the registered definition before replacing or deleting a role-specific task. */
+export function windowsTaskQueryCommand(env?: NodeJS.ProcessEnv): ServiceCommand;
+export function windowsTaskQueryCommand(role: ServiceRole, env?: NodeJS.ProcessEnv): ServiceCommand;
+export function windowsTaskQueryCommand(
+  roleOrEnv: ServiceRole | NodeJS.ProcessEnv = "host",
+  explicitEnv: NodeJS.ProcessEnv = process.env
+): ServiceCommand {
+  const role = typeof roleOrEnv === "string" ? roleOrEnv : "host";
+  const env = typeof roleOrEnv === "string" ? explicitEnv : roleOrEnv;
+  return [windowsSystemTool("schtasks.exe", env), ["/Query", "/TN", windowsTaskName(role), "/XML"]];
 }
 
 export function windowsTaskLauncherExecutablePath(
@@ -447,7 +459,9 @@ export function windowsPlan(
   env: NodeJS.ProcessEnv = process.env,
   launcherExecutable: string = windowsLauncherExecutablePath(home)
 ): ServicePlan {
-  const xmlPath = taskXmlPath(home);
+  const role = spec.role ?? "host";
+  const task = windowsTaskName(role);
+  const xmlPath = taskXmlPath(home, role);
   const schtasks = windowsSystemTool("schtasks.exe", env);
   return {
     mechanism: "schtasks-logon",
@@ -455,14 +469,22 @@ export function windowsPlan(
     content: renderTaskXml(spec, env, home, launcherExecutable),
     // The installer adds /F only after an existing definition passes the
     // ownership check. A missing or unreadable task can never be overwritten.
-    installCommands: [[schtasks, ["/Create", "/TN", TASK_NAME, "/XML", xmlPath]]],
-    uninstallCommands: [[schtasks, ["/Delete", "/TN", TASK_NAME, "/F"]]],
-    stopCommands: [[schtasks, ["/End", "/TN", TASK_NAME]]],
-    statusCommand: [schtasks, ["/Query", "/TN", TASK_NAME, "/FO", "LIST"]],
+    installCommands: [[schtasks, ["/Create", "/TN", task, "/XML", xmlPath]]],
+    uninstallCommands: [[schtasks, ["/Delete", "/TN", task, "/F"]]],
+    stopCommands: [[schtasks, ["/End", "/TN", task]]],
+    statusCommand: [schtasks, ["/Query", "/TN", task, "/FO", "LIST"]],
     notes: [
       "A logon task, not a Windows Service: it starts when this user logs on and stops at logoff.",
       "Installing a real service would need elevation and a service-host wrapper.",
       "Dry-run XML uses an unresolved launcher template; real install compiles, validates, hashes, and publishes the GUI launcher before registration.",
+      ...(role === "tunnel"
+        ? [
+            // RestartOnFailure in the task XML gives three retries a minute
+            // apart, which covers a logon that beats the network up.
+            "`connect` exits non-zero until the runtime is healthy; RestartOnFailure retries it three times, a minute apart.",
+            "Ending the task does not stop the runtime, so uninstall deletes the task before explicitly running `tunnel stop`.",
+          ]
+        : []),
     ],
   };
 }

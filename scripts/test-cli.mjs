@@ -10,11 +10,12 @@
  */
 import { execFile } from "child_process";
 import fs from "fs/promises";
+import net from "net";
 import os from "os";
 import path from "path";
 import { fileURLToPath } from "url";
 
-import { formatServiceOutcome } from "../dist/cli/commands/service.js";
+import { formatServiceOutcome, shouldContinueServiceBatch } from "../dist/cli/commands/service.js";
 
 let passed = 0;
 let failed = 0;
@@ -387,6 +388,17 @@ await checkAsync("service failure text reports whether recovery metadata remains
   assert(!/Installed/.test(absent), `failed operation reported success: ${absent}`);
 });
 
+await checkAsync("paired uninstall continues after an absent or failed optional companion", async () => {
+  const failed = {
+    plan: { mechanism: "schtasks-logon" },
+    unitWritten: String.raw`C:\state\ChatGPTLocalCoderTunnel.xml`,
+    commandResults: [{ command: "schtasks /Query", exitCode: 1, stderr: "task not found" }],
+    metadataPresent: false,
+  };
+  assert(shouldContinueServiceBatch("uninstall", failed), "the host would be stranded behind the missing tunnel");
+  assert(!shouldContinueServiceBatch("install", failed), "install continued after its host dependency failed");
+});
+
 await checkAsync("service --dry-run prints a unit without installing anything", async () => {
   for (const platform of ["linux", "darwin", "win32"]) {
     const result = await run(["service", "install", "--dry-run", "--platform", platform, "--json"]);
@@ -435,6 +447,100 @@ await checkAsync("service status reports rather than installs", async () => {
   assert(status.installed === false, "nothing should be installed in the sandbox");
   assert(typeof status.mechanism === "string", `mechanism: ${status.mechanism}`);
   assert(result.code === 1, `a missing service should exit non-zero, got ${result.code}`);
+});
+
+await checkAsync("--with-tunnel plans two units and installs the host first", async () => {
+  for (const platform of ["linux", "darwin", "win32"]) {
+    const result = await run(["service", "install", "--with-tunnel", "--dry-run", "--platform", platform, "--json"]);
+    assert(result.code === 0, `${platform} exited ${result.code}: ${result.stderr}`);
+
+    const plans = JSON.parse(result.stdout);
+    assert(Array.isArray(plans) && plans.length === 2, `${platform}: expected a host and a tunnel plan`);
+    const [host, tunnel] = plans;
+    const hostLaunch = platform === "win32" ? taskLaunchText(host.content) : host.content;
+    const tunnelLaunch = platform === "win32" ? taskLaunchText(tunnel.content) : tunnel.content;
+    assert(hostLaunch.includes("--no-tunnel"), `${platform}: the host unit still runs the server alone`);
+    assert(tunnelLaunch.includes("--wait-for-server"), `${platform}: the tunnel unit should wait for the host`);
+    assert(tunnelLaunch.includes("--alias"), `${platform}: the companion did not pin its alias`);
+    assert(tunnelLaunch.includes("acceptance-host"), `${platform}: the companion pinned the wrong alias`);
+    assert(tunnel.unitPath !== host.unitPath, `${platform}: the two units would overwrite each other`);
+    // Order matters on install: the tunnel has nothing to publish until the
+    // host unit exists.
+    assert(!hostLaunch.includes("--wait-for-server"), `${platform}: the plans came back in the wrong order`);
+  }
+});
+
+await checkAsync("without --with-tunnel the JSON shape is unchanged", async () => {
+  // Existing callers parse a single object; only the opt-in flag turns it into
+  // an array.
+  const one = JSON.parse((await run(["service", "install", "--dry-run", "--platform", "linux", "--json"])).stdout);
+  assert(!Array.isArray(one), "a single-unit install must not become an array");
+  assert(typeof one.unitPath === "string", `unitPath: ${one.unitPath}`);
+
+  const statuses = JSON.parse((await run(["service", "status", "--with-tunnel", "--json"])).stdout);
+  assert(Array.isArray(statuses) && statuses.length === 2, "status should cover both units");
+  assert(statuses[0].role === "host" && statuses[1].role === "tunnel", "each entry should name its role");
+});
+
+// ------------------------------------------------------------------ preflight
+// A second `up` over a running one used to reach the server process, which
+// crashed on the admin port with a raw Node stack trace — and on the way out
+// stopped the tunnel belonging to the instance that was already running.
+
+/** Hold a port the way a running instance would. */
+function holdPort() {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    server.listen(0, "127.0.0.1", () =>
+      resolve({ port: server.address().port, close: () => new Promise((done) => server.close(done)) })
+    );
+  });
+}
+
+await checkAsync("up refuses to start when the MCP port is taken", async () => {
+  const held = await holdPort();
+  const spare = await holdPort();
+  const free = spare.port;
+  await spare.close();
+
+  try {
+    const result = await run(["up", "--no-tunnel", "--port", String(held.port), "--admin-port", String(free)]);
+    assert(result.code === 2, `a refused start is a usage error, got ${result.code}: ${result.all}`);
+    assert(result.all.includes(`MCP port ${held.port} already in use`), `unhelpful message: ${result.all}`);
+    assert(!result.all.includes("admin port"), "only the port that is actually taken should be named");
+    assert(/--port and --admin-port/.test(result.all), "the way to run a second instance should be stated");
+  } finally {
+    await held.close();
+  }
+});
+
+await checkAsync("up refuses to start when only the admin port is taken", async () => {
+  // The case that produced the original crash: the MCP port was overridden and
+  // the admin port silently kept its default.
+  const held = await holdPort();
+  const spare = await holdPort();
+  const free = spare.port;
+  await spare.close();
+
+  try {
+    const result = await run(["up", "--no-tunnel", "--port", String(free), "--admin-port", String(held.port)]);
+    assert(result.code === 2, `exit ${result.code}: ${result.all}`);
+    assert(result.all.includes(`admin port ${held.port} already in use`), `unhelpful message: ${result.all}`);
+  } finally {
+    await held.close();
+  }
+});
+
+await checkAsync("up documents --admin-port alongside --port", async () => {
+  const help = (await run(["up", "--help"])).all;
+  assert(/--admin-port/.test(help), "an override that only exists in the source is not an override");
+  assert(/--port/.test(help), "--port should still be listed");
+});
+
+await checkAsync("tunnel connect documents the readiness wait", async () => {
+  const help = (await run(["tunnel", "--help"])).all;
+  assert(/--wait-for-server/.test(help), "the service units pass this flag; it must be documented");
+  assert(/--wait-timeout/.test(help), "the timeout should be adjustable");
 });
 
 // ------------------------------------------------------------------ version
