@@ -425,8 +425,27 @@ export async function loadProjectMemory(
   return bundle;
 }
 
+const OMISSION_DESCRIPTIONS: Record<ProjectMemoryOmissionReason, string> = {
+  byte_budget_exhausted: "not loaded: the content byte budget was already used up by earlier sections",
+  empty_after_transform: "not loaded: nothing was left after removing comments and expanding imports",
+  empty_after_limits: "not loaded: all of its content was removed by the configured limits",
+  unreadable: "not loaded: the file could not be read",
+};
+
+function sectionTruncationNote(section: ProjectMemorySection): string {
+  if (section.truncation_reasons.length === 0) return "";
+  const label =
+    section.truncation_reasons.length === 2
+      ? "line and byte limits"
+      : section.truncation_reasons[0] === "line_limit"
+        ? "line limit"
+        : "byte limit";
+  return ` (truncated: ${label})`;
+}
+
 export function formatProjectMemoryForInstructions(bundle: ProjectMemoryBundle): string {
-  if (bundle.sections.length === 0) {
+  if (bundle.sections.length === 0 && bundle.omitted_sections.length === 0) {
+    // No memory candidate file was found (or selected) at all.
     return [
       "## Project memory",
       `No CLAUDE.md or AGENTS.md at ${bundle.root}.`,
@@ -441,7 +460,7 @@ export function formatProjectMemoryForInstructions(bundle: ProjectMemoryBundle):
   }
 
   const blocks = bundle.sections.map((s) => {
-    const note = s.truncated ? " (truncated)" : "";
+    const note = sectionTruncationNote(s);
     const label =
       s.kind === "user"
         ? "User memory"
@@ -453,16 +472,36 @@ export function formatProjectMemoryForInstructions(bundle: ProjectMemoryBundle):
     return `### ${label}: ${s.path}${note}\n${s.content}`;
   });
 
-  return [
+  const intro = [
     "## Project memory (auto-loaded like Claude Code CLAUDE.md)",
     `Primary root: ${bundle.root}`,
     "Treat content below as ground truth for conventions, build commands, and architecture.",
     bundle.workspace_roots.length > 1
       ? `All workspace roots:\n${bundle.workspace_roots.map((r) => `- ${r}`).join("\n")}`
       : "",
-    "",
-    ...blocks,
-  ]
-    .filter(Boolean)
-    .join("\n");
+  ].filter(Boolean);
+
+  // Diagnostics: tell the agent what was selected but could not be loaded,
+  // case by case. The loader's selection order and content stay untouched.
+  const notes: string[] = [];
+  if (bundle.omitted_sections.length > 0) {
+    notes.push("## Project memory loading notes");
+    notes.push(
+      `Content budget: ${bundle.memory_limits.max_content_bytes} bytes in total, ${bundle.memory_limits.max_lines_per_section} lines per section.`
+    );
+    notes.push("Some memory files were selected but could not contribute content:");
+    for (const omitted of bundle.omitted_sections) {
+      const reasonText = OMISSION_DESCRIPTIONS[omitted.reason];
+      const truncText = omitted.truncation_reasons.length
+        ? ` (truncation: ${omitted.truncation_reasons.join(", ")})`
+        : "";
+      notes.push(`- ${omitted.path}: ${reasonText}${truncText}`);
+    }
+    notes.push("Use read_text_file to read the full file when its content is relevant.");
+  } else if (bundle.sections.length === 0) {
+    notes.push("## Project memory loading notes");
+    notes.push("Memory files were selected at this root but none produced loadable content.");
+  }
+
+  return [...intro, "", ...blocks, ...(notes.length ? ["", ...notes] : [])].join("\n");
 }

@@ -92,7 +92,13 @@ export function summarizeInstructionContext(ctx: InstructionContext): Record<str
     workspace_roots: pm.workspace_roots,
     memory_contract_version: "clc.project-memory-summary.v1",
     memory_limits: pm.memory_limits,
-    memory_limit_sources: pm.memory_limit_sources,
+    // Public boundary mapping: the bundle tracks sources with the internal
+    // camelCase key names; the public object must use exactly the same two
+    // keys as memory_limits (plan §14.1 / review REV-R01).
+    memory_limit_sources: {
+      max_lines_per_section: pm.memory_limit_sources.maxLines,
+      max_content_bytes: pm.memory_limit_sources.maxBytes,
+    },
     memory_files: pm.sections.map((s) => ({
       path: s.path,
       kind: s.kind,

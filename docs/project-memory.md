@@ -86,7 +86,7 @@ The `/health` endpoint (and the admin `/health`) expose, under `instructions`:
 - `memory_contract_version` — `clc.project-memory-summary.v1`
 - `memory_limits` — `{ max_lines_per_section, max_content_bytes }` actually in
   effect for the startup bundle.
-- `memory_limit_sources` — `default` / `env` / `opts` per key.
+- `memory_limit_sources` — `default` / `env` / `opts` per key, using the same two key names as `memory_limits` (`max_lines_per_section` / `max_content_bytes`).
 - `memory_files[]` — `path`, `kind`, `truncated`, `content_bytes`,
   `truncation_reasons`.
 - `memory_omitted_counts` — exactly the four omission keys, each a
@@ -102,6 +102,40 @@ confirm it is talking to the intended instance instead of any HTTP 200.
 The metadata describes the bundle loaded at startup; it is not re-read from
 disk per health request and it does not hot-reload when environment variables
 change afterwards. Start a new instance to pick up new limits.
+
+## Missing-content diagnostics in instructions
+
+When some selected memory files could not contribute content, the formatted
+project-memory block tells the agent exactly which case applies:
+
+- no candidate file existed at all — the loader says so and suggests creating
+  one;
+- a candidate could not be read — reported as unreadable, not as a missing
+  file;
+- a candidate was empty after comment removal/import expansion;
+- a candidate's content was entirely removed by the limits (with the
+  truncation reasons);
+- a candidate was skipped because the content byte budget was already spent
+  (the effective budget is named);
+- a loaded section was cut by the line limit, the byte limit, or both — the
+  heading carries the specific label.
+
+These notes are instruction formatting only: they never change the selected
+section order or content, never raise the budget, and they stay out of the
+public health surface (health keeps counts only).
+
+## Maintenance rehearsal tooling
+
+`scripts/deployment-machine.mjs` implements the section-17 state machine
+(journal intents before mutations, results after verification, rename-only
+slot changes, one candidate start and one baseline start per transition,
+baseline rollback judged by the baseline's own schema) against injected
+filesystem/service/supervisor/lock adapters — it is the logic an operator
+would drive during a coordinated cutover, and it never touches a real host by
+itself. `scripts/test-deployment-machine.mjs` (F23) rehearses the mandatory
+failure modes against test-owned slot directories and a fake supervisor.
+`scripts/test-lib/mcp-test-harness.mjs` is the shared deadline/lifecycle/port
+harness used by the server-level tests and the isolated canary.
 
 ## Related configuration
 

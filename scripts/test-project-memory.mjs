@@ -10,16 +10,23 @@
  * Env used by the runner (optional):
  *   CLC_EVIDENCE_DIR   — write per-fixture result records there
  *   CLC_TEST_TAG       — suffix for the results file name
- *   CLC_GOLDEN_DIR     — when set, capture F18 import goldens; otherwise compare
  *   CLC_SOURCE_SHA / CLC_SOURCE_SHA_ROLE / CLC_PATCH_SHA256 /
  *   CLC_SOURCE_TREE_SHA256 / CLC_EXPECTED_REF — source identity per §12.3
  */
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import http from "node:http";
-import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import {
+  Deadline,
+  OwnedChild,
+  allocPortPair,
+  buildClcServerEnv,
+  fetchJsonBounded,
+  probeCandidateHealth,
+  registryCleanup,
+  startStub,
+} from "./test-lib/mcp-test-harness.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..");
@@ -47,7 +54,7 @@ const evidenceDir = process.env.CLC_EVIDENCE_DIR || null;
 const testTag = process.env.CLC_TEST_TAG || "run";
 
 const pmModule = await import("../dist/lib/project-memory.js");
-const { loadProjectMemory } = pmModule;
+const { loadProjectMemory, formatProjectMemoryForInstructions } = pmModule;
 const ProjectMemoryConfigError = pmModule.ProjectMemoryConfigError;
 const icModule = await import("../dist/lib/instruction-context.js");
 const { buildInstructionContext, summarizeInstructionContext } = icModule;
@@ -693,15 +700,97 @@ async function runUnitFixtures() {
       "summary contract fields",
       summary.memory_contract_version === "clc.project-memory-summary.v1" &&
         summary.memory_limits?.max_lines_per_section === 500 &&
-        summary.memory_limits?.max_content_bytes === 32768 &&
-        summary.memory_limit_sources?.maxLines === "default" &&
-        summary.memory_limit_sources?.maxBytes === "default",
-      "v1/500/32768/default/default",
+        summary.memory_limits?.max_content_bytes === 32768,
+      "v1/500/32768",
       JSON.stringify({
         v: summary.memory_contract_version,
         limits: summary.memory_limits,
-        sources: summary.memory_limit_sources,
       })
+    );
+    // REV-R01: the PUBLIC source map must use exactly the same two key names
+    // as memory_limits (max_lines_per_section / max_content_bytes), each value
+    // one of default/env/opts, and no internal camelCase keys may leak out.
+    const publicSources = summary.memory_limit_sources ?? {};
+    check(
+      "REV-R01",
+      "public memory_limit_sources has exactly the two spec keys",
+      JSON.stringify(Object.keys(publicSources).sort()) ===
+        JSON.stringify(["max_content_bytes", "max_lines_per_section"]),
+      "[max_content_bytes,max_lines_per_section]",
+      JSON.stringify(Object.keys(publicSources).sort())
+    );
+    check(
+      "REV-R01",
+      "public sources values are default/default (defaults fixture)",
+      publicSources.max_lines_per_section === "default" &&
+        publicSources.max_content_bytes === "default",
+      "default/default",
+      JSON.stringify(publicSources)
+    );
+    check(
+      "REV-R01",
+      "no internal camelCase keys leak into the public summary",
+      !JSON.stringify(summary).includes("maxLines") &&
+        !JSON.stringify(summary).includes("maxBytes"),
+      "no maxLines/maxBytes",
+      JSON.stringify(summary).slice(0, 200)
+    );
+    // Mixed sources: opts for one key, env for the other (and vice versa).
+    {
+      process.env.PROJECT_MEMORY_MAX_BYTES = "4096";
+      const mixed = await loadProjectMemory(dir, { maxLines: 123 });
+      const mixedSources = mixed.memory_limit_sources ?? {};
+      check(
+        "REV-R01",
+        "mixed sources: lines=opts, bytes=env",
+        mixedSources.maxLines === "opts" && mixedSources.maxBytes === "env" &&
+          mixed.memory_limits?.max_lines_per_section === 123 &&
+          mixed.memory_limits?.max_content_bytes === 4096,
+        "opts/env",
+        JSON.stringify(mixedSources)
+      );
+      delete process.env.PROJECT_MEMORY_MAX_BYTES;
+      process.env.PROJECT_MEMORY_MAX_LINES = "77";
+      const mixed2 = await loadProjectMemory(dir, { maxBytes: 8192 });
+      delete process.env.PROJECT_MEMORY_MAX_LINES;
+      check(
+        "REV-R01",
+        "mixed sources: lines=env, bytes=opts",
+        mixed2.memory_limit_sources?.maxLines === "env" &&
+          mixed2.memory_limit_sources?.maxBytes === "opts" &&
+          mixed2.memory_limits?.max_lines_per_section === 77 &&
+          mixed2.memory_limits?.max_content_bytes === 8192,
+        "env/opts",
+        JSON.stringify(mixed2.memory_limit_sources)
+      );
+      // Invalid env masked by a valid opts value for the SAME key: no error.
+      process.env.PROJECT_MEMORY_MAX_LINES = "not-a-number";
+      const masked = await loadProjectMemory(dir, { maxLines: 200 }).then(
+        (b) => ({ bundle: b, error: null }),
+        (e) => ({ bundle: null, error: e })
+      );
+      delete process.env.PROJECT_MEMORY_MAX_LINES;
+      check(
+        "REV-R01",
+        "invalid env masked by valid opts does not fail",
+        masked.error === null &&
+          masked.bundle?.memory_limit_sources?.maxLines === "opts",
+        "opts wins, no error",
+        JSON.stringify({ error: masked.error?.message, sources: masked.bundle?.memory_limit_sources })
+      );
+    }
+    // Old summary fields must survive (no data removed, no private data added).
+    check(
+      "REV-R01",
+      "legacy summary fields preserved",
+      typeof summary.root === "string" &&
+        Array.isArray(summary.workspace_roots) &&
+        typeof summary.memory_bytes === "number" &&
+        typeof summary.instruction_bytes === "number" &&
+        typeof summary.loaded_at === "string" &&
+        typeof summary.tool_profile === "string",
+      "legacy fields present",
+      JSON.stringify(Object.keys(summary).sort())
     );
     check(
       "T10",
@@ -731,129 +820,127 @@ async function runUnitFixtures() {
       "present"
     );
   }
+
+  // REV-R03 — the formatter must tell the agent WHAT is missing, case by
+  // case. It must not claim files do not exist when they do, and it must not
+  // collapse every problem into a generic "truncated" label.
+  {
+    const NO_CANDIDATE_MARKER = "No CLAUDE.md or AGENTS.md";
+    // Case 1: no candidates at all.
+    {
+      const dir = mkFixture({});
+      const bundle = await loadProjectMemory(dir);
+      const text = formatProjectMemoryForInstructions(bundle);
+      check(
+        "REV-R03",
+        "no candidates: formatter suggests creating a file",
+        text.includes(NO_CANDIDATE_MARKER) && !text.includes("loading notes"),
+        "no-candidate guidance",
+        text.slice(0, 160)
+      );
+    }
+    // Case 2: candidate exists but unreadable (a directory named CLAUDE.md).
+    {
+      const dir = mkFixture({});
+      fs.mkdirSync(path.join(dir, "CLAUDE.md"));
+      const bundle = await loadProjectMemory(dir);
+      const text = formatProjectMemoryForInstructions(bundle);
+      check(
+        "REV-R03",
+        "unreadable candidate: formatter says unreadable, not 'file missing'",
+        !text.includes(NO_CANDIDATE_MARKER) &&
+          text.includes("could not be read") &&
+          bundle.omitted_sections?.[0]?.reason === "unreadable",
+        "unreadable note",
+        text.slice(0, 260)
+      );
+    }
+    // Case 3: only empty after comment/trim.
+    {
+      const dir = mkFixture({ "AGENTS.md": "<!-- note -->\n   \n" });
+      const bundle = await loadProjectMemory(dir);
+      const text = formatProjectMemoryForInstructions(bundle);
+      check(
+        "REV-R03",
+        "empty-after-transform: formatter explains emptiness, not 'file missing'",
+        !text.includes(NO_CANDIDATE_MARKER) &&
+          text.includes("removing comments") &&
+          text.includes("AGENTS.md"),
+        "empty_after_transform note",
+        text.slice(0, 300)
+      );
+    }
+    // Case 4 (REV-R03.A): content existed but limits removed it all.
+    {
+      const dir = mkFixture({ "AGENTS.md": `${"\n".repeat(500)}TAIL` });
+      const bundle = await loadProjectMemory(dir);
+      const text = formatProjectMemoryForInstructions(bundle);
+      check(
+        "REV-R03",
+        "all content limited away: formatter blames limits, not a missing file",
+        !text.includes(NO_CANDIDATE_MARKER) &&
+          text.includes("AGENTS.md") &&
+          text.includes("limits") &&
+          text.includes("line_limit") &&
+          !text.includes("Create CLAUDE.md"),
+        "limits note with line_limit",
+        text.slice(0, 320)
+      );
+    }
+    // Case 5 (REV-R03.B): some sections omitted by budget, some loaded.
+    {
+      const dir = mkFixture({ "CLAUDE.md": "AAAA", "AGENTS.md": "BBBB" });
+      const bundle = await loadProjectMemory(dir, { maxBytes: 4, maxLines: 500 });
+      const text = formatProjectMemoryForInstructions(bundle);
+      const aaaa = text.indexOf("AAAA");
+      const note = text.indexOf("content byte budget");
+      check(
+        "REV-R03",
+        "budget omission: loaded content kept, omitted file named with reason and budget",
+        aaaa > -1 &&
+          note > -1 &&
+          text.includes("AGENTS.md") &&
+          text.includes("4 bytes") &&
+          text.includes("read_text_file"),
+        "AAAA + AGENTS.md byte_budget_exhausted + budget + guidance",
+        text.slice(0, 400)
+      );
+    }
+    // Case 6: partially loaded sections — per-reason labels.
+    {
+      const cases = [
+        { files: { "AGENTS.md": lines(600) }, label: "line limit", reasons: ["line_limit"] },
+        { files: { "AGENTS.md": "a".repeat(40000) }, label: "byte limit", reasons: ["byte_limit"] },
+        { files: { "AGENTS.md": "AA\nBB\nCC" }, opts: { maxLines: 2, maxBytes: 3 }, label: "line and byte limits", reasons: ["line_limit", "byte_limit"] },
+      ];
+      for (const c of cases) {
+        const dir = mkFixture(c.files);
+        const bundle = await loadProjectMemory(dir, c.opts);
+        const text = formatProjectMemoryForInstructions(bundle);
+        check(
+          "REV-R03",
+          `partial load labeled as truncated: ${c.label}`,
+          text.includes(`truncated: ${c.label}`) &&
+            JSON.stringify(bundle.sections?.[0]?.truncation_reasons) === JSON.stringify(c.reasons) &&
+            text.includes("### Project: "),
+          `truncated: ${c.label}`,
+          text.slice(0, 300)
+        );
+      }
+    }
+  }
 }
 
 // =====================================================================
-// Server-level fixtures F19–F23
+// Server-level fixtures F19–F23 (REV-R04: deadline-bounded, owned ports,
+// identity-checked health via the shared harness).
 // =====================================================================
-
-function makeServerEnv(overrides = {}) {
-  const base = path.join(
-    os.tmpdir(),
-    `clc-pm-server-${process.pid}-${Math.random().toString(36).slice(2)}`
-  );
-  const env = {
-    // Toolchain lookup only — the parent (test runner) is already inside the
-    // harness environment, so its PATH is the approved one. Nothing else is
-    // inherited from the operator's environment.
-    PATH: process.env.PATH || "",
-    HOME: fixtureHome,
-    XDG_CONFIG_HOME: path.join(base, "xdg-config"),
-    XDG_STATE_HOME: path.join(base, "xdg-state"),
-    XDG_CACHE_HOME: path.join(base, "xdg-cache"),
-    CLC_CONFIG_DIR: path.join(base, "clc-config"),
-    CLC_STATE_DIR: path.join(base, "clc-state"),
-    CLC_CACHE_DIR: path.join(base, "clc-cache"),
-    MCP_SHELL_STATE_DIR: path.join(base, "shell-state"),
-    CODEX_HOME: path.join(base, "codex"),
-    CHECKPOINT_PATH: path.join(base, "checkpoints"),
-    AUDIT_LOG_PATH: path.join(base, "logs", "audit.jsonl"),
-    MCP_UPSTREAM_CONFIG: path.join(base, "upstream.json"),
-    TMPDIR: path.join(base, "tmp"),
-    TMP: path.join(base, "tmp"),
-    TEMP: path.join(base, "tmp"),
-    CLC_PERMISSION_PROFILE: "workspace",
-    CLC_SETTINGS_IMPORT: "false",
-    CLC_DELEGATES: "false",
-    CLC_HOOKS: "false",
-    CLC_SKILL_EXECUTION: "false",
-    CHATGPT_TOOL_PROFILE: "slim",
-    ...(process.platform === "win32"
-      ? {
-          USERPROFILE: fixtureHome,
-          APPDATA: path.join(fixtureHome, "appdata", "roaming"),
-          LOCALAPPDATA: path.join(fixtureHome, "appdata", "local"),
-        }
-      : {}),
-    ...overrides,
-  };
-  fs.mkdirSync(env.TMPDIR, { recursive: true });
-  fs.mkdirSync(path.dirname(env.AUDIT_LOG_PATH), { recursive: true });
-  fs.writeFileSync(env.MCP_UPSTREAM_CONFIG, '{"version":1,"servers":[]}');
-  return env;
-}
-
-function freePort() {
-  return new Promise((resolve, reject) => {
-    const srv = http.createServer();
-    srv.once("error", reject);
-    srv.listen(0, "127.0.0.1", () => {
-      const port = srv.address().port;
-      srv.close(() => resolve(port));
-    });
-  });
-}
-
-function spawnServer(env, port) {
-  const child = spawn(process.execPath, ["dist/index.js"], {
-    cwd: repoRoot,
-    env,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  let output = "";
-  child.stdout?.on("data", (d) => (output += d));
-  child.stderr?.on("data", (d) => (output += d));
-  child.__output = () => output;
-  return child;
-}
-
-function waitExit(child, ms = 30000) {
-  return new Promise((resolve) => {
-    let done = false;
-    const timer = setTimeout(() => {
-      if (!done) {
-        done = true;
-        try { child.kill("SIGKILL"); } catch {}
-        resolve({ code: "timeout", output: child.__output() });
-      }
-    }, ms);
-    child.on("exit", (code, signal) => {
-      if (!done) {
-        done = true;
-        clearTimeout(timer);
-        resolve({ code, signal, output: child.__output() });
-      }
-    });
-  });
-}
-
-async function waitForHealth(port, ms = 30000) {
-  const t0 = Date.now();
-  while (Date.now() - t0 < ms) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
-      if (res.ok) return await res.json();
-    } catch {}
-    await new Promise((r) => setTimeout(r, 200));
-  }
-  return null;
-}
-
-async function reachable(port, ms = 1500) {
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/health`, {
-      signal: AbortSignal.timeout(ms),
-    });
-    return res.ok;
-  } catch {
-    return false;
-  }
-}
 
 const UUID_RE =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 async function runServerFixtures() {
+  const deadline = new Deadline(240000);
   const marker = `CLCPMMARKER-${Math.random().toString(36).slice(2)}`;
   const serverWs = mkFixture({
     "AGENTS.md": [
@@ -864,52 +951,62 @@ async function runServerFixtures() {
       "END",
     ].join("\n"),
   });
+  const envBase = mkFixture("clc-pm-env-");
+  const serverEnv = (overrides) =>
+    buildClcServerEnv(envBase, fixtureHome, serverWs, overrides);
 
   // F19 — port occupied by another (run-owned) host returning 200: candidate must fail.
   {
-    const port = await freePort();
+    const { mcpPort, adminPort } = await allocPortPair();
     const STUB_MARKER = "stub-owner-marker";
-    const stub = http.createServer((_req, res) => {
-      res.end(JSON.stringify({ status: "stub", marker: STUB_MARKER }));
-    });
-    await new Promise((res) => stub.listen(port, "127.0.0.1", res));
-    const child = spawnServer(
-      makeServerEnv({
-        PORT: String(port),
-        ADMIN_PORT: String(port + 1),
-        WORKSPACE_PATH: serverWs,
-        ADMIN_TOKEN: "fixture-admin-token",
-      }),
-      port
+    const stub = startStub(mcpPort, { mode: "respond", body: { status: "stub", marker: STUB_MARKER } });
+    await stub.listening;
+    const child = new OwnedChild(
+      process.execPath,
+      ["dist/index.js"],
+      {
+        cwd: repoRoot,
+        name: "f19-port-conflict",
+        env: serverEnv({
+          PORT: String(mcpPort),
+          ADMIN_PORT: String(adminPort),
+          ADMIN_TOKEN: "fixture-admin-token",
+        }),
+      }
     );
-    const outcome = await waitExit(child, 30000);
+    const outcome = await child.waitExit(deadline, 45000);
     check("F19", "candidate exits non-zero when port is taken", outcome.code === 1, "exit 1", JSON.stringify({ code: outcome.code, signal: outcome.signal }));
-    const body = await fetch(`http://127.0.0.1:${port}/health`).then((r) => r.json()).catch(() => null);
+    const probe = await probeCandidateHealth(deadline, mcpPort, child.pid);
+    const body = await fetchJsonBounded(deadline, `http://127.0.0.1:${mcpPort}/health`, { timeoutMs: 3000 }).then((r) => r.body).catch(() => null);
     check(
       "F19",
       "health on the port still belongs to the stub owner, not the candidate",
-      body?.marker === STUB_MARKER && body?.runtime_instance_id === undefined,
-      "stub marker, no instance id",
-      JSON.stringify(body)
+      body?.marker === STUB_MARKER && body?.runtime_instance_id === undefined && probe.ok === false,
+      "stub marker, no instance id, identity probe refused",
+      JSON.stringify({ body, probeKind: probe.kind })
     );
-    check("F19", "stub owner is still alive (candidate must not stop it)", stub.listening === true, "listening", String(stub.listening));
-    await new Promise((res) => stub.close(res));
+    check("F19", "stub owner is still alive (candidate must not stop it)", stub.server.listening === true, "listening", String(stub.server.listening));
   }
 
   // F20 + F21 — instance identity, stable across boots and health polls.
-  const port = await freePort();
-  const env = makeServerEnv({
+  const { mcpPort: port, adminPort } = await allocPortPair();
+  const env = serverEnv({
     PORT: String(port),
-    ADMIN_PORT: String(port + 1),
-    WORKSPACE_PATH: serverWs,
+    ADMIN_PORT: String(adminPort),
     ADMIN_TOKEN: "fixture-admin-token",
   });
-  const child1 = spawnServer(env, port);
-  const h1 = await waitForHealth(port);
-  check("F20", "health reachable on first boot", h1 !== null, "health json", JSON.stringify(h1?.status ?? null));
+  const child1 = new OwnedChild(process.execPath, ["dist/index.js"], {
+    cwd: repoRoot,
+    name: "f20-boot1",
+    env,
+  });
+  const probe1 = await probeCandidateHealth(deadline, port, child1.pid);
+  const h1 = probe1.ok ? probe1.body : null;
+  check("F20", "health reachable on first boot (identity-verified)", h1 !== null, "health json with matching pid", JSON.stringify(probe1.kind));
   check("F20", "runtime_pid equals child pid", h1?.runtime_pid === child1.pid, String(child1.pid), String(h1?.runtime_pid));
   check("F20", "runtime_instance_id is a UUID", UUID_RE.test(h1?.runtime_instance_id ?? ""), "uuid v4", String(h1?.runtime_instance_id));
-  const h1b = await waitForHealth(port);
+  const probe1b = await probeCandidateHealth(deadline, port, child1.pid);
+  const h1b = probe1b.ok ? probe1b.body : null;
   check(
     "F20",
     "same boot: UUID and PID stable across polls",
@@ -926,6 +1023,18 @@ async function runServerFixtures() {
       ins?.memory_contract_version === "clc.project-memory-summary.v1",
     "500/32768/v1",
     JSON.stringify({ limits: ins?.memory_limits, version: ins?.memory_contract_version })
+  );
+  const insSources = ins?.memory_limit_sources ?? {};
+  check(
+    "REV-R01",
+    "health sources use the public spec key names",
+    JSON.stringify(Object.keys(insSources).sort()) ===
+      JSON.stringify(["max_content_bytes", "max_lines_per_section"]) &&
+      insSources.max_lines_per_section === "default" &&
+      insSources.max_content_bytes === "default" &&
+      !JSON.stringify(ins).includes("maxLines"),
+    "spec keys, default/default, no camelCase",
+    JSON.stringify(insSources)
   );
   const om = ins?.memory_omitted_counts ?? {};
   check(
@@ -948,6 +1057,7 @@ async function runServerFixtures() {
         "Content-Type": "application/json",
         Accept: "application/json, text/event-stream",
       },
+      signal: deadline.signal(30000),
       body: JSON.stringify({
         jsonrpc: "2.0",
         id: 1,
@@ -960,9 +1070,9 @@ async function runServerFixtures() {
       }),
     });
     const text = await initRes.text();
-    check("F21", "initialize response includes fixture marker", text.includes(marker), marker, "in response");
+    check("F21", "initialize response includes fixture marker", text.includes(marker), `marker ${marker} found`, `${marker.length}-char marker: ${text.includes(marker) ? "found" : "not found"}`);
     for (const name of F02A_NAMES) {
-      check("F21", `initialize response includes ${name}`, text.includes(name), name, "in response");
+      check("F21", `initialize response includes ${name}`, text.includes(name), `${name} found`, text.includes(name) ? "found" : "not found");
     }
     const sid = initRes.headers.get("mcp-session-id");
     const toolsRes = await fetch(`http://127.0.0.1:${port}/mcp`, {
@@ -973,6 +1083,7 @@ async function runServerFixtures() {
         "mcp-session-id": sid,
         "mcp-protocol-version": "2025-03-26",
       },
+      signal: deadline.signal(30000),
       body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
     });
     const toolsText = await toolsRes.text();
@@ -980,19 +1091,23 @@ async function runServerFixtures() {
       "F21",
       "tools/list works on the new session (basic tools present)",
       sid !== null && toolsText.includes("apply_patch") && toolsText.includes("run_command"),
-      "apply_patch + run_command",
+      "session + apply_patch + run_command",
       JSON.stringify({ sid: sid !== null, has_patch: toolsText.includes("apply_patch"), has_run: toolsText.includes("run_command") })
     );
   }
 
-  // F20 continued — second boot: new UUID, matching PID.
-  await new Promise((resolve) => {
-    child1.once("exit", resolve);
-    child1.kill("SIGTERM");
+  // F20 continued — second boot: new UUID, matching PID. This is an identity
+  // assertion only: it does NOT claim anything about a production supervisor
+  // (supervisor restart observation belongs to the F23 state-machine suite).
+  await child1.stop(deadline);
+  const child2 = new OwnedChild(process.execPath, ["dist/index.js"], {
+    cwd: repoRoot,
+    name: "f20-boot2",
+    env,
   });
-  const child2 = spawnServer(env, port);
-  const h2 = await waitForHealth(port);
-  check("F20", "second boot health reachable", h2 !== null, "health json", String(h2 === null));
+  const probe2 = await probeCandidateHealth(deadline, port, child2.pid);
+  const h2 = probe2.ok ? probe2.body : null;
+  check("F20", "second boot health reachable (identity-verified)", h2 !== null, "health json with matching pid", JSON.stringify(probe2.kind));
   check("F20", "second boot runtime_pid equals child pid", h2?.runtime_pid === child2.pid, String(child2.pid), String(h2?.runtime_pid));
   check(
     "F20",
@@ -1001,44 +1116,51 @@ async function runServerFixtures() {
     "new uuid",
     `${h1?.runtime_instance_id} -> ${h2?.runtime_instance_id}`
   );
-  // single-start observation: this harness never auto-restarts the child
   check(
-    "F23",
-    "harness does not auto-restart a stopped child (single start per boot)",
+    "F20",
+    "boot identity: second spawn is a new process with its own pid",
     child2.pid !== child1.pid && h2?.runtime_pid === child2.pid,
-    "no auto-restart",
-    JSON.stringify({ pid1: child1.pid, pid2: child2.pid })
+    "distinct pids per boot",
+    JSON.stringify({ pid1: child1.pid, pid2: child2.pid, pid1Alive: child1.exitInfo === null })
   );
-  await new Promise((resolve) => {
-    child2.once("exit", resolve);
-    child2.kill("SIGTERM");
-  });
+  await child2.stop(deadline);
 
   // F22 — invalid limit: exit 1 before bind, error names code/key/source, no raw value.
   {
-    const portBad = await freePort();
-    const child = spawnServer(
-      makeServerEnv({
-        PORT: String(portBad),
-        ADMIN_PORT: String(portBad + 1),
-        WORKSPACE_PATH: serverWs,
-        ADMIN_TOKEN: "fixture-admin-token",
-        PROJECT_MEMORY_MAX_LINES: "500abc",
-      }),
-      portBad
+    const { mcpPort: portBad, adminPort: adminPortBad } = await allocPortPair();
+    const child = new OwnedChild(
+      process.execPath,
+      ["dist/index.js"],
+      {
+        cwd: repoRoot,
+        name: "f22-bad-limit",
+        env: serverEnv({
+          PORT: String(portBad),
+          ADMIN_PORT: String(adminPortBad),
+          ADMIN_TOKEN: "fixture-admin-token",
+          PROJECT_MEMORY_MAX_LINES: "500abc",
+        }),
+      }
     );
-    const outcome = await waitExit(child, 30000);
+    const outcome = await child.waitExit(deadline, 45000);
     check("F22", "invalid limit -> exit code 1", outcome.code === 1, "exit 1", JSON.stringify({ code: outcome.code, signal: outcome.signal }));
-    const out = outcome.output ?? "";
+    const out = child.output ?? "";
     check(
       "F22",
       "error names code/key/source",
       out.includes("ERR_PROJECT_MEMORY_LIMIT") && out.includes("maxLines") && out.includes("env"),
-      "code+key+source",
-      out.slice(0, 400)
+      "code+key+source present",
+      out.slice(0, 300)
     );
-    check("F22", "raw input value not printed", !out.includes("500abc"), "no raw value", out.slice(0, 400));
-    check("F22", "port was never bound", !(await reachable(portBad)), "not bound", String(await reachable(portBad)));
+    check("F22", "raw input value not printed", !out.includes("500abc"), "no raw value", out.slice(0, 300));
+    let bound = true;
+    try {
+      const r = await fetchJsonBounded(deadline, `http://127.0.0.1:${portBad}/health`, { timeoutMs: 2000 });
+      bound = r.ok;
+    } catch {
+      bound = false;
+    }
+    check("F22", "port was never bound", bound === false, "not bound", String(bound));
   }
 }
 
@@ -1054,14 +1176,14 @@ async function runInstructionShapeChecks() {
     adminPort: 3001,
   });
 
-  check("T10", "agent prompt in instructions", ctx.instructionsText.includes("Agent workflow"), "present", "missing");
-  check("T10", "environment block", ctx.instructionsText.includes("## Environment"), "present", "missing");
-  check("T10", "git block", ctx.instructionsText.includes("## Git"), "present", "missing");
-  check("T10", "footer pointers", ctx.instructionsText.includes("agent_status"), "present", "missing");
-  check("T10", "instruction size > 500 bytes", ctx.instructionBytes >= 500, ">=500", String(ctx.instructionBytes));
+  check("T10", "agent prompt in instructions", ctx.instructionsText.includes("Agent workflow"), "found:true", JSON.stringify({ found: ctx.instructionsText.includes("Agent workflow") }));
+  check("T10", "environment block", ctx.instructionsText.includes("## Environment"), "found:true", JSON.stringify({ found: ctx.instructionsText.includes("## Environment") }));
+  check("T10", "git block", ctx.instructionsText.includes("## Git"), "found:true", JSON.stringify({ found: ctx.instructionsText.includes("## Git") }));
+  check("T10", "footer pointers", ctx.instructionsText.includes("agent_status"), "found:true", JSON.stringify({ found: ctx.instructionsText.includes("agent_status") }));
+  check("T10", "instruction size > 500 bytes", ctx.instructionBytes >= 500, "bytes>=500", String(ctx.instructionBytes));
 
   const summary = summarizeInstructionContext(ctx);
-  check("T10", "summarizeInstructionContext has root", Boolean(summary.root), "root", JSON.stringify(summary.root));
+  check("T10", "summarizeInstructionContext has root", Boolean(summary.root), "root:true", JSON.stringify({ has_root: Boolean(summary.root) }));
 
   console.log("\nGit:", ctx.git.is_repo ? ctx.git.branch : "not a repo");
   console.log(
@@ -1071,7 +1193,8 @@ async function runInstructionShapeChecks() {
 }
 
 // =====================================================================
-// Main
+// Main — all server/child/stub resources are owned by the harness registry;
+// cleanup runs even when a fixture throws (REV-R04).
 // =====================================================================
 try {
   await runUnitFixtures();
@@ -1081,6 +1204,8 @@ try {
   console.error("FATAL", err);
   failed++;
   record("FATAL", "fail", "no fatal error", String(err?.stack || err));
+} finally {
+  await registryCleanup(new Deadline(15000));
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);
