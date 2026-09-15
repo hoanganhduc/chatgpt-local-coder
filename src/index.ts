@@ -33,6 +33,8 @@ import {
   type InstructionContext,
 } from "./lib/instruction-context.js";
 import { getChatGptToolProfile } from "./lib/tool-profile.js";
+import { ProjectMemoryConfigError } from "./lib/project-memory.js";
+import { randomUUID } from "node:crypto";
 import { loadSkillRegistry } from "./skills/registry.js";
 import { checkImportedRules, loadSettings } from "./settings/index.js";
 import { setHookConfig } from "./hooks/engine.js";
@@ -40,6 +42,11 @@ import { registerPostEditHook } from "./lib/post-edit-hooks.js";
 import { detectDelegates } from "./delegates/index.js";
 import { installLogTimestamps } from "./lib/log-timestamp.js";
 import { rotateServerLog } from "./services/index.js";
+
+// One random identity per boot. It disambiguates which instance a health
+// probe is talking to (plan §14.2); it is not a credential and carries no
+// private content.
+const RUNTIME_INSTANCE_ID = randomUUID();
 
 // Before the first line is written, so the whole boot is stamped and a log that
 // survived the previous run is not appended to indefinitely.
@@ -92,13 +99,27 @@ const skillRegistry = await loadSkillRegistry({
   disabled: config.skills.disabled,
 });
 
-const instructionContext: InstructionContext = await buildInstructionContext({
-  workspaceRoot,
-  workspaceRoots,
-  pid: process.pid,
-  adminPort: ADMIN_PORT,
-  fullDiskAccess: getFullDiskAccess(),
-});
+let instructionContext: InstructionContext;
+try {
+  instructionContext = await buildInstructionContext({
+    workspaceRoot,
+    workspaceRoots,
+    pid: process.pid,
+    adminPort: ADMIN_PORT,
+    fullDiskAccess: getFullDiskAccess(),
+  });
+} catch (error) {
+  // A bad project memory limit must refuse to start before MCP/Admin bind,
+  // and it must never be swallowed by file-read handling (§13.1).
+  if (error instanceof ProjectMemoryConfigError) {
+    console.error(
+      `[ERROR] Project memory limit configuration: code=${error.code} key=${error.key} source=${error.source}`
+    );
+    console.error(`[ERROR] ${error.message}`);
+    process.exit(1);
+  }
+  throw error;
+}
 
 if (instructionContext.projectMemory.sections.length > 0) {
   console.log(
@@ -273,6 +294,8 @@ app.get("/health", (_req, res) => {
   res.json({
     status: "ok",
     name: "codex-mcp-server",
+    runtime_instance_id: RUNTIME_INSTANCE_ID,
+    runtime_pid: process.pid,
     workspace: workspaceRoot,
     defaultCwd: getDefaultCwd(),
     permissionProfile: config.permissionProfile,

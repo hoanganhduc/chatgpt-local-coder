@@ -76,6 +76,8 @@ const unitScripts = [
   // practice however carefully it was written.
   "scripts/test-mcp-upstream.mjs",
   "scripts/test-activity-log.mjs",
+  // Fixtures F01-F23: limits/validation/truncation/metadata unit fixtures plus
+  // server-level instance identity checks (owned ports, no production env).
   "scripts/test-project-memory.mjs",
   "scripts/test-tool-profile.mjs",
   "scripts/test-tool-failure.mjs",

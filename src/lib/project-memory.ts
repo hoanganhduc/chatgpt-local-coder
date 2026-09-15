@@ -21,14 +21,76 @@ const USER_MEMORY_CANDIDATES = [
 
 const RULES_GLOB_MAX = 12;
 const IMPORT_MAX_DEPTH = 4;
-const DEFAULT_MAX_BYTES = parseInt(process.env.PROJECT_MEMORY_MAX_BYTES || "25000", 10);
-const DEFAULT_MAX_LINES = parseInt(process.env.PROJECT_MEMORY_MAX_LINES || "200", 10);
+
+export const PROJECT_MEMORY_DEFAULT_MAX_LINES = 500;
+export const PROJECT_MEMORY_DEFAULT_MAX_BYTES = 32 * 1024;
+
+/**
+ * Per-key source resolution (plan §13.1). Both keys resolve independently:
+ * `opts` > non-empty `env` > default. Only the selected source is validated;
+ * an invalid env value masked by a valid opts value must not fail the call.
+ */
+const LIMIT_SPECS = {
+  maxLines: {
+    env: "PROJECT_MEMORY_MAX_LINES",
+    default: PROJECT_MEMORY_DEFAULT_MAX_LINES,
+  },
+  maxBytes: {
+    env: "PROJECT_MEMORY_MAX_BYTES",
+    default: PROJECT_MEMORY_DEFAULT_MAX_BYTES,
+  },
+} as const;
+
+export type ProjectMemoryLimitKey = keyof typeof LIMIT_SPECS;
+export type ProjectMemoryLimitSource = "default" | "env" | "opts";
+export type ProjectMemoryTruncationReason = "line_limit" | "byte_limit";
+export type ProjectMemoryOmissionReason =
+  | "byte_budget_exhausted"
+  | "empty_after_transform"
+  | "empty_after_limits"
+  | "unreadable";
+
+export class ProjectMemoryConfigError extends Error {
+  readonly code = "ERR_PROJECT_MEMORY_LIMIT" as const;
+  readonly key: ProjectMemoryLimitKey;
+  readonly source: "opts" | "env";
+
+  constructor(key: ProjectMemoryLimitKey, source: "opts" | "env") {
+    super(
+      `Invalid project memory limit: ${key} (${source}); expected a positive safe integer.`
+    );
+    this.name = "ProjectMemoryConfigError";
+    this.key = key;
+    this.source = source;
+  }
+}
+
+export interface ProjectMemoryOptions {
+  maxBytes?: number;
+  maxLines?: number;
+  workspaceRoots?: string[];
+}
 
 export interface ProjectMemorySection {
   path: string;
   content: string;
   truncated: boolean;
   kind: "user" | "project" | "rule" | "import";
+  content_bytes: number;
+  truncation_reasons: ProjectMemoryTruncationReason[];
+}
+
+/** Internal diagnostic for a selected candidate that produced no content. */
+export interface OmittedMemorySection {
+  path: string;
+  kind: ProjectMemorySection["kind"];
+  reason: ProjectMemoryOmissionReason;
+  truncation_reasons: ProjectMemoryTruncationReason[];
+}
+
+export interface ProjectMemoryLimits {
+  max_lines_per_section: number;
+  max_content_bytes: number;
 }
 
 export interface ProjectMemoryBundle {
@@ -37,6 +99,41 @@ export interface ProjectMemoryBundle {
   sections: ProjectMemorySection[];
   total_bytes: number;
   loaded_at: string;
+  memory_limits: ProjectMemoryLimits;
+  memory_limit_sources: Record<ProjectMemoryLimitKey, ProjectMemoryLimitSource>;
+  memory_omitted_counts: Record<ProjectMemoryOmissionReason, number>;
+  /** Candidate-order diagnostics. Public health exposes only the counts. */
+  omitted_sections: OmittedMemorySection[];
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function resolveLimit(
+  key: ProjectMemoryLimitKey,
+  opts: ProjectMemoryOptions | undefined
+): { value: number; source: ProjectMemoryLimitSource } {
+  const spec = LIMIT_SPECS[key];
+  const optValue = opts?.[key];
+  if (optValue !== undefined) {
+    // `undefined` means absent; anything else supplied must be a positive
+    // safe integer or the call rejects with source=opts (no fallback).
+    if (!isPositiveSafeInteger(optValue)) {
+      throw new ProjectMemoryConfigError(key, "opts");
+    }
+    return { value: optValue, source: "opts" };
+  }
+
+  const rawEnv = process.env[spec.env];
+  const trimmed = rawEnv === undefined ? "" : rawEnv.trim();
+  if (trimmed === "") return { value: spec.default, source: "default" };
+  // Only ASCII digits; `00500` and ` 500 ` are valid 500, while `+500`,
+  // `5e2`, `500.0`, `500abc` and friends reject instead of parseInt prefixes.
+  if (!/^[0-9]+$/.test(trimmed)) throw new ProjectMemoryConfigError(key, "env");
+  const parsed = Number(trimmed);
+  if (!isPositiveSafeInteger(parsed)) throw new ProjectMemoryConfigError(key, "env");
+  return { value: parsed, source: "env" };
 }
 
 async function fileExists(filePath: string): Promise<boolean> {
@@ -52,39 +149,98 @@ function stripHtmlComments(text: string): string {
   return text.replace(/<!--[\s\S]*?-->/g, "");
 }
 
+/**
+ * Longest prefix of `text` whose UTF-8 byte length fits `budget` and that ends
+ * on a Unicode code-point boundary. Multibyte characters are never cut in the
+ * middle, so valid UTF-8 input never gains U+FFFD from truncation.
+ */
+function utf8PrefixWithinBudget(text: string, budget: number): string {
+  const buf = Buffer.from(text, "utf-8");
+  let end = Math.min(budget, buf.length);
+  while (end > 0) {
+    const b = buf[end - 1];
+    if ((b & 0x80) === 0) break; // ASCII: clean boundary
+    if ((b & 0xc0) === 0x80) {
+      end--; // continuation byte: back off
+      continue;
+    }
+    const len = b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : 2;
+    const charEnd = end - 1 + len;
+    if (charEnd <= budget) {
+      end = charEnd; // whole character fits: move past it
+      break;
+    }
+    end--; // lead byte of a character that would be cut: back off
+  }
+  return buf.subarray(0, end).toString("utf-8");
+}
+
 function hasPathsFrontmatter(content: string): boolean {
   const match = content.match(/^---\r?\n([\s\S]*?)\r?\n---/);
   if (!match) return false;
   return /^paths\s*:/m.test(match[1]);
 }
 
+interface ReadMemoryOutcome {
+  section?: ProjectMemorySection;
+  omission?: { reason: ProjectMemoryOmissionReason; truncation_reasons: ProjectMemoryTruncationReason[] };
+}
+
+/**
+ * Plan §13.2 pipeline for one readable candidate with remaining budget B > 0:
+ * S = comment removal + import expansion + CRLF→LF normalization;
+ * L = first maxLines lines of S; P = longest UTF-8 code-point-boundary prefix
+ * of L within B bytes; content = P.trim(). Reasons are recorded in
+ * line-then-byte order; a candidate that empties out is an omission, not a
+ * hard stop for the remaining candidates.
+ */
 async function readTextLimited(
   filePath: string,
-  maxBytes: number,
+  budgetBytes: number,
   maxLines: number,
   kind: ProjectMemorySection["kind"]
-): Promise<ProjectMemorySection | null> {
+): Promise<ReadMemoryOutcome> {
+  let full: string;
   try {
     const buf = await fs.readFile(filePath);
-    let full = stripHtmlComments(buf.toString("utf-8"));
-    full = await expandImportsInContent(full, path.dirname(filePath));
-
-    const lines = full.split(/\r?\n/).slice(0, maxLines);
-    const lineLimited = lines.join("\n");
-    const byteLimited =
-      Buffer.byteLength(lineLimited, "utf-8") > maxBytes
-        ? Buffer.from(lineLimited, "utf-8").subarray(0, maxBytes).toString("utf-8")
-        : lineLimited;
-    const truncated =
-      buf.length > maxBytes ||
-      full.split(/\r?\n/).length > maxLines ||
-      byteLimited.length < full.length;
-    const trimmed = byteLimited.trim();
-    if (!trimmed) return null;
-    return { path: filePath, content: trimmed, truncated, kind };
+    full = stripHtmlComments(buf.toString("utf-8"));
   } catch {
-    return null;
+    return { omission: { reason: "unreadable", truncation_reasons: [] } };
   }
+  full = await expandImportsInContent(full, path.dirname(filePath));
+
+  const s = full.replace(/\r\n/g, "\n");
+  if (s.trim() === "") {
+    return { omission: { reason: "empty_after_transform", truncation_reasons: [] } };
+  }
+
+  const reasons: ProjectMemoryTruncationReason[] = [];
+  let l = s;
+  if (s.split("\n").length > maxLines) {
+    l = s.split("\n").slice(0, maxLines).join("\n");
+    if (l.trim() !== s.trim()) reasons.push("line_limit");
+  }
+
+  let p = l;
+  if (Buffer.byteLength(l, "utf-8") > budgetBytes) {
+    p = utf8PrefixWithinBudget(l, budgetBytes);
+    if (p.trim() !== l.trim()) reasons.push("byte_limit");
+  }
+
+  const content = p.trim();
+  if (content === "") {
+    return { omission: { reason: "empty_after_limits", truncation_reasons: reasons } };
+  }
+  return {
+    section: {
+      path: filePath,
+      content,
+      truncated: reasons.length > 0,
+      kind,
+      content_bytes: Buffer.byteLength(content, "utf-8"),
+      truncation_reasons: reasons,
+    },
+  };
 }
 
 async function expandImportsInContent(content: string, baseDir: string): Promise<string> {
@@ -181,63 +337,92 @@ async function listUnconditionalRuleFiles(rulesDir: string): Promise<string[]> {
   return found.sort().slice(0, RULES_GLOB_MAX);
 }
 
+function emptyOmissionCounts(): Record<ProjectMemoryOmissionReason, number> {
+  return {
+    byte_budget_exhausted: 0,
+    empty_after_transform: 0,
+    empty_after_limits: 0,
+    unreadable: 0,
+  };
+}
+
 async function appendSection(
-  sections: ProjectMemorySection[],
-  totalBytes: { value: number },
+  bundle: ProjectMemoryBundle,
+  remaining: { value: number },
   maxBytes: number,
   maxLines: number,
   filePath: string,
   kind: ProjectMemorySection["kind"]
 ): Promise<void> {
-  if (totalBytes.value >= maxBytes) return;
-  const section = await readTextLimited(
-    filePath,
-    maxBytes - totalBytes.value,
-    maxLines,
-    kind
-  );
-  if (!section?.content) return;
-  sections.push(section);
-  totalBytes.value += Buffer.byteLength(section.content, "utf-8");
+  const budget = maxBytes - remaining.value;
+  if (budget <= 0) {
+    // Budget exhausted: the selected candidate is skipped without reading it
+    // just for statistics (§13.2).
+    bundle.omitted_sections.push({
+      path: filePath,
+      kind,
+      reason: "byte_budget_exhausted",
+      truncation_reasons: [],
+    });
+    bundle.memory_omitted_counts.byte_budget_exhausted++;
+    return;
+  }
+  const outcome = await readTextLimited(filePath, budget, maxLines, kind);
+  if (outcome.section) {
+    bundle.sections.push(outcome.section);
+    remaining.value += outcome.section.content_bytes;
+  } else if (outcome.omission) {
+    bundle.omitted_sections.push({ path: filePath, kind, ...outcome.omission });
+    bundle.memory_omitted_counts[outcome.omission.reason]++;
+  }
 }
 
 export async function loadProjectMemory(
   workspaceRoot: string,
-  opts?: { maxBytes?: number; maxLines?: number; workspaceRoots?: string[] }
+  opts?: ProjectMemoryOptions
 ): Promise<ProjectMemoryBundle> {
-  const maxBytes = opts?.maxBytes ?? DEFAULT_MAX_BYTES;
-  const maxLines = opts?.maxLines ?? DEFAULT_MAX_LINES;
+  // Resolved independently per key, before any memory file is read.
+  const maxLines = resolveLimit("maxLines", opts);
+  const maxBytes = resolveLimit("maxBytes", opts);
   const root = path.resolve(workspaceRoot);
   const workspace_roots = opts?.workspaceRoots ?? [root];
-  const sections: ProjectMemorySection[] = [];
-  const totalBytes = { value: 0 };
+  const bundle: ProjectMemoryBundle = {
+    root,
+    workspace_roots,
+    sections: [],
+    total_bytes: 0,
+    loaded_at: new Date().toISOString(),
+    memory_limits: {
+      max_lines_per_section: maxLines.value,
+      max_content_bytes: maxBytes.value,
+    },
+    memory_limit_sources: { maxLines: maxLines.source, maxBytes: maxBytes.source },
+    memory_omitted_counts: emptyOmissionCounts(),
+    omitted_sections: [],
+  };
+  const remaining = { value: 0 };
 
   for (const userPath of USER_MEMORY_CANDIDATES) {
     if (!(await fileExists(userPath))) continue;
-    await appendSection(sections, totalBytes, maxBytes, maxLines, userPath, "user");
+    await appendSection(bundle, remaining, maxBytes.value, maxLines.value, userPath, "user");
     break;
   }
 
   for (const rel of ROOT_MEMORY_FILES) {
     const filePath = path.join(root, rel);
     if (!(await fileExists(filePath))) continue;
-    await appendSection(sections, totalBytes, maxBytes, maxLines, filePath, "project");
+    await appendSection(bundle, remaining, maxBytes.value, maxLines.value, filePath, "project");
   }
 
   const rulesDir = path.join(root, ".claude", "rules");
-  if (totalBytes.value < maxBytes && (await fileExists(rulesDir))) {
+  if (remaining.value < maxBytes.value && (await fileExists(rulesDir))) {
     for (const ruleFile of await listUnconditionalRuleFiles(rulesDir)) {
-      await appendSection(sections, totalBytes, maxBytes, maxLines, ruleFile, "rule");
+      await appendSection(bundle, remaining, maxBytes.value, maxLines.value, ruleFile, "rule");
     }
   }
 
-  return {
-    root,
-    workspace_roots,
-    sections,
-    total_bytes: totalBytes.value,
-    loaded_at: new Date().toISOString(),
-  };
+  bundle.total_bytes = remaining.value;
+  return bundle;
 }
 
 export function formatProjectMemoryForInstructions(bundle: ProjectMemoryBundle): string {
