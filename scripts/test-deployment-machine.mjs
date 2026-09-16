@@ -287,7 +287,12 @@ function makeScenario({
     journalPath: path.join(base, "journal.jsonl"),
     lockPath: path.join(base, "lock.json"),
   };
-  for (const d of [slots.liveDir, slots.candidateDir, slots.backupDir, slots.failedRuntimesDir]) {
+  // Plan §17: the backup destination must NOT pre-exist — preserve() renames
+  // live→backup, and Windows cannot rename a directory over an existing one.
+  // Only the slots parent plus live/candidate/failed-runtimes are created;
+  // scenarios that need an occupied/foreign backup create it explicitly.
+  fs.mkdirSync(path.dirname(slots.liveDir), { recursive: true });
+  for (const d of [slots.liveDir, slots.candidateDir, slots.failedRuntimesDir]) {
     fs.mkdirSync(d, { recursive: true });
   }
   writeRuntime(slots.liveDir, "baseline");
@@ -623,6 +628,8 @@ if (process.platform !== "win32") {
   await s.machine.prepare();
   await s.machine.quiesce();
   await s.machine.stop();
+  // Occupied backup: create the slot explicitly, then park a stray file in it.
+  fs.mkdirSync(s.slots.backupDir, { recursive: true });
   fs.writeFileSync(path.join(s.slots.backupDir, "stray.js"), "STRAY\n");
   const state = s.machine.preserve();
   const h = s.hashes();
