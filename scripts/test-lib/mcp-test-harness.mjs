@@ -58,9 +58,13 @@ export class Deadline {
 /**
  * Bounded JSON fetch. Covers: no response headers, HTTP 200 with a body that
  * never ends, invalid JSON, and a response from the wrong instance (optional
- * `predicate`). On deadline/timeout the promise always settles.
+ * `predicate`). The HTTP status is part of acceptance: a non-success status
+ * is rejected BEFORE the identity predicate runs (a 500 carrying the right
+ * PID/UUID is still a failure). `requireStatus` accepts a number (exact
+ * match, used for /health) or `"2xx"` (default: any success status).
+ * On deadline/timeout the promise always settles.
  */
-export async function fetchJsonBounded(deadline, url, { timeoutMs = 5000, predicate } = {}) {
+export async function fetchJsonBounded(deadline, url, { timeoutMs = 5000, predicate, requireStatus = "2xx" } = {}) {
   const signal = deadline.signal(timeoutMs);
   let response;
   try {
@@ -70,6 +74,16 @@ export async function fetchJsonBounded(deadline, url, { timeoutMs = 5000, predic
       throw new Error(`no response headers from ${url} within deadline/timeout`);
     }
     throw err;
+  }
+  const statusOk =
+    requireStatus === "2xx" ? response.status >= 200 && response.status < 300 : response.status === requireStatus;
+  if (!statusOk) {
+    return {
+      ok: false,
+      kind: "bad-status",
+      status: response.status,
+      body: null,
+    };
   }
   let text;
   try {
@@ -247,6 +261,7 @@ export async function probeCandidateHealth(deadline, port, expectedPid) {
     try {
       const result = await fetchJsonBounded(deadline, `http://127.0.0.1:${port}/health`, {
         timeoutMs: 3000,
+        requireStatus: 200, // health acceptance requires the exact status, not just a parseable body
         predicate: (body) =>
           body?.runtime_pid === expectedPid && uuidPattern.test(body?.runtime_instance_id ?? ""),
       });
@@ -280,26 +295,68 @@ export function startStub(port, { mode = "respond", status = 200, body = {}, raw
     res.writeHead(status, { "content-type": rawText ? "text/plain" : "application/json" });
     res.end(rawText ?? JSON.stringify(body));
   });
-  const closed = new Promise((resolve) => srv.close(() => resolve()));
+  const state = { listening: false, closed: false, closing: false };
+  const sockets = new Set();
+  srv.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("close", () => sockets.delete(socket));
+  });
   const listening = new Promise((resolve, reject) => {
     srv.once("error", reject);
-    srv.listen(port, "127.0.0.1", () => resolve());
+    srv.listen(port, "127.0.0.1", () => {
+      state.listening = true;
+      resolve();
+    });
   });
-  registry.add(async () => {
-    await closed;
+  /** Close the currently listening server, exactly once, with a bounded
+   *  strategy for active/pending connections: after a short grace period any
+   *  connection still open is destroyed so the port is actually released. */
+  const closeServer = () =>
+    new Promise((resolve) => {
+      if (state.closed || state.closing) {
+        state.closing = true;
+        const wait = setInterval(() => {
+          if (state.closed) {
+            clearInterval(wait);
+            resolve();
+          }
+        }, 25);
+        wait.unref?.();
+        setTimeout(resolve, 3000).unref?.(); // hard bound if close never reports
+        return;
+      }
+      state.closing = true;
+      try {
+        srv.close(() => {
+          state.closed = true;
+          resolve();
+        });
+      } catch {
+        state.closed = true;
+        resolve();
+      }
+      const grace = setTimeout(() => {
+        for (const socket of sockets) socket.destroy();
+      }, 500);
+      grace.unref?.();
+      setTimeout(() => {
+        if (!state.closed) {
+          state.closed = true; // a server that ignores close: destroy every connection
+          for (const socket of sockets) socket.destroy();
+        }
+        resolve();
+      }, 3000).unref?.();
+    });
+  registry.add(async (deadline) => {
+    if (state.closed) return; // idempotent
+    if (!state.listening) return; // listen never succeeded: nothing owns the socket
+    await boundedAwait(deadline, closeServer(), "stub close");
   });
   return {
     server: srv,
     listening,
     async close() {
-      await new Promise((resolve) => {
-        try {
-          srv.close(() => resolve());
-        } catch {
-          resolve();
-        }
-        setTimeout(resolve, 500).unref?.();
-      });
+      await closeServer();
     },
   };
 }

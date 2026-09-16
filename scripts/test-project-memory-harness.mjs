@@ -6,6 +6,7 @@
  * or stopped. Run: node scripts/test-project-memory-harness.mjs
  */
 import fs from "node:fs";
+import http from "node:http";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -245,6 +246,79 @@ const main = async () => {
       String(err?.message)
     );
   }
+
+  // 12. H1: HTTP status is part of health acceptance — a 500 carrying the
+  //     EXPECTED pid/uuid must be rejected before any identity check.
+  await guarded("HTTP 500 with matching identity rejected", 6000, async (d) => {
+    const port = await allocPort();
+    await startStub(port, {
+      mode: "respond",
+      status: 500,
+      body: { status: "ok", runtime_pid: 424242, runtime_instance_id: "12345678-1234-4234-8234-123456789abc" },
+    }).listening;
+    const probe = await probeCandidateHealth(d, port, 424242);
+    check(
+      "HTTP 500 with matching identity rejected",
+      probe.ok === false && probe.kind === "bad-status",
+      "bad-status (identity never accepted)",
+      JSON.stringify({ ok: probe.ok, kind: probe.kind })
+    );
+    const direct = await fetchJsonBounded(d, `http://127.0.0.1:${port}/health`, {
+      timeoutMs: 3000,
+      requireStatus: 200,
+      predicate: () => true,
+    });
+    check(
+      "non-200 status rejected before identity predicate",
+      direct.ok === false && direct.kind === "bad-status" && direct.body === null,
+      "bad-status, body not parsed",
+      JSON.stringify({ ok: direct.ok, kind: direct.kind, body: direct.body })
+    );
+  });
+
+  // 13. H2: registry cleanup must actually close the listening stub — the
+  //     port must be rebindable afterwards.
+  await guarded("stub cleanup releases listening socket", 15000, async (d) => {
+    const port = await allocPort();
+    const stub = startStub(port, { mode: "respond", body: { status: "ok" } });
+    await stub.listening;
+    await registryCleanup(d);
+    const rebound = await new Promise((resolve) => {
+      const srv = http.createServer((req, res) => res.end("rebound"));
+      srv.once("error", () => resolve(false));
+      srv.listen(port, "127.0.0.1", () => srv.close(() => resolve(true)));
+    });
+    check(
+      "stub cleanup releases listening socket",
+      rebound === true,
+      "port rebindable after cleanup",
+      JSON.stringify({ rebound })
+    );
+  });
+
+  // 14. H2: cleanup with a live pending connection — the bounded connection
+  //     strategy must still release the port.
+  await guarded("stub cleanup closes pending connections", 15000, async (d) => {
+    const port = await allocPort();
+    const stub = startStub(port, { mode: "pendingHeaders" });
+    await stub.listening;
+    const conn = http.request({ host: "127.0.0.1", port, path: "/health", method: "GET" });
+    conn.end();
+    await d.sleep(300); // let the connection reach the server and stay open
+    await registryCleanup(d);
+    conn.destroy();
+    const rebound = await new Promise((resolve) => {
+      const srv = http.createServer((req, res) => res.end("rebound"));
+      srv.once("error", () => resolve(false));
+      srv.listen(port, "127.0.0.1", () => srv.close(() => resolve(true)));
+    });
+    check(
+      "stub cleanup closes pending connections",
+      rebound === true,
+      "port rebindable with live connection",
+      JSON.stringify({ rebound })
+    );
+  });
 
   console.log(`\n${passed} passed, ${failed} failed`);
   await registryCleanup(new Deadline(10000));

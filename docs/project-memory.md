@@ -127,13 +127,22 @@ public health surface (health keeps counts only).
 ## Maintenance rehearsal tooling
 
 `scripts/deployment-machine.mjs` implements the section-17 state machine
-(journal intents before mutations, results after verification, rename-only
-slot changes, one candidate start and one baseline start per transition,
-baseline rollback judged by the baseline's own schema) against injected
-filesystem/service/supervisor/lock adapters — it is the logic an operator
-would drive during a coordinated cutover, and it never touches a real host by
-itself. `scripts/test-deployment-machine.mjs` (F23) rehearses the mandatory
-failure modes against test-owned slot directories and a fake supervisor.
+against injected filesystem/service/supervisor/lock/journal/config adapters —
+it is the logic an operator would drive during a coordinated cutover, and it
+never touches a real host by itself. The runtime is modelled as complete
+immutable asset sets: live/candidate/backup are whole runtime directories and
+the release manifest (`clc.memory-release.v1`) lists every asset's
+path/type/mode/SHA-256 plus source/build identity, so a missing or altered
+non-entrypoint file blocks the rehearsal. The maintenance receipt is validated
+against the release-manifest hash and the parent-supplied plan hash, and its
+expiry/quiescence evidence is rechecked immediately before stop. Journal
+intents are written and fsynced before every mutation, results are recorded
+after verification, and the two limit overrides are applied/restored (including
+unset keys) through an injected configuration adapter. Candidate and baseline
+starts are deadline-bounded and require consecutive healthy samples with
+stable supervisor counters and instance identity. `scripts/test-deployment-machine.mjs` (F23)
+rehearses the mandatory failure modes against test-owned slot directories and
+a fake supervisor.
 `scripts/test-lib/mcp-test-harness.mjs` is the shared deadline/lifecycle/port
 harness used by the server-level tests and the isolated canary.
 
