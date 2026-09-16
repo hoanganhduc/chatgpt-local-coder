@@ -72,6 +72,13 @@ function cleanupScenario(s) {
   } catch {
     /* a failed close must not stop cleanup */
   }
+  try {
+    // The machine may have been driven with a swapped-in journal (fault
+    // injection); close that one too before removing the temp root.
+    if (s && typeof s.machine?.deps?.journal?.close === "function") s.machine.deps.journal.close();
+  } catch {
+    /* a failed close must not stop cleanup */
+  }
   if (s) rmTreeRetry(s.base);
 }
 

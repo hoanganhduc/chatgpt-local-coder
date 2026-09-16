@@ -1031,12 +1031,14 @@ export function realFsAdapter() {
 /**
  * Durable JSONL journal: append() buffers, flush() writes every pending
  * record to the sink and fsyncs the file so the intent is durable before the
- * next destructive transition is allowed. A write/sync failure propagates to
- * the machine, which blocks before mutating anything.
+ * next destructive transition is allowed. The file is opened, written,
+ * fsynced and CLOSED inside each flush: no handle outlives the call, so the
+ * journal never pins its sink against deletion (Windows CI-safe) and every
+ * flush is durable on its own. A write/sync failure propagates to the
+ * machine, which blocks before mutating anything.
  */
 export function memoryJournal(sinkPath) {
   const records = [];
-  let fd = null;
   let flushed = 0;
   return {
     append(record) {
@@ -1044,25 +1046,22 @@ export function memoryJournal(sinkPath) {
     },
     flush() {
       if (records.length === flushed) return;
-      if (fd === null) fd = fs.openSync(sinkPath, "a");
-      for (let i = flushed; i < records.length; i++) {
-        fs.writeSync(fd, `${JSON.stringify(records[i])}\n`);
+      const fd = fs.openSync(sinkPath, "a");
+      try {
+        for (let i = flushed; i < records.length; i++) {
+          fs.writeSync(fd, `${JSON.stringify(records[i])}\n`);
+        }
+        fs.fsyncSync(fd);
+        flushed = records.length;
+      } finally {
+        fs.closeSync(fd);
       }
-      fs.fsyncSync(fd);
-      flushed = records.length;
     },
     records() {
       return records.slice();
     },
     close() {
-      if (fd !== null) {
-        try {
-          fs.closeSync(fd);
-        } catch {
-          /* already closed */
-        }
-        fd = null;
-      }
+      // No persistent handle: nothing to close. Kept for adapter symmetry.
     },
   };
 }
