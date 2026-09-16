@@ -36,6 +36,45 @@ function check(id, name, cond, expected, actual) {
   return cond;
 }
 
+/** Bounded, ownership-safe cross-platform test cleanup. Scenario journals hold
+ *  an open file handle (durability by design); Windows cannot delete a file
+ *  that still has an open handle, so cleanup closes the scenario's journal
+ *  first and then removes the temp root with a FINITE retry for transient
+ *  EBUSY/ENOTEMPTY/EPERM. This fixes test teardown only — it never changes
+ *  state-machine behavior or weakens any F23 expectation. */
+const CLEANUP_RETRIES = 8;
+const CLEANUP_RETRY_DELAY_MS = 25;
+const RETRYABLE_CLEANUP_CODES = new Set(["EBUSY", "ENOTEMPTY", "EPERM", "EACCES", "EMFILE"]);
+
+function syncSleep(ms) {
+  // Synchronous bounded sleep on the main thread, no worker needed.
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+function rmTreeRetry(target) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < CLEANUP_RETRIES; attempt++) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true });
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (!RETRYABLE_CLEANUP_CODES.has(err.code)) throw err;
+      if (attempt < CLEANUP_RETRIES - 1) syncSleep(CLEANUP_RETRY_DELAY_MS);
+    }
+  }
+  throw lastErr;
+}
+
+function cleanupScenario(s) {
+  try {
+    if (s && typeof s.journal?.close === "function") s.journal.close();
+  } catch {
+    /* a failed close must not stop cleanup */
+  }
+  if (s) rmTreeRetry(s.base);
+}
+
 const PLAN_SHA = "8ad39507fd7fe06154c7a5bd8e0d9f21a6995bacefec9a1fde98a909fe20cf6f";
 const SOURCE_SHA = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const OVERRIDE_KEYS = ["PROJECT_MEMORY_MAX_LINES", "PROJECT_MEMORY_MAX_BYTES"];
@@ -393,7 +432,7 @@ for (const [label, overrides] of [
     "BLOCKED_BEFORE_STOP + no side effects",
     JSON.stringify({ state, startCount: s.service.startCount, serviceState: s.service.state, hashes: h })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +456,7 @@ for (const [label, tamper] of [
     "BLOCKED_BEFORE_STOP",
     JSON.stringify({ state, serviceState: s.service.state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 if (process.platform !== "win32") {
   const s = makeScenario();
@@ -431,7 +470,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP",
     JSON.stringify({ state, serviceState: s.service.state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 } else {
   console.log("NOTE F23-02 mode-tamper case not applicable on win32 (POSIX mode bits)");
 }
@@ -448,7 +487,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP",
     JSON.stringify({ state, serviceState: s.service.state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -465,7 +504,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP",
     JSON.stringify({ state, serviceState: s.service.state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Config adapter returning a wrong shape (extra/missing keys) must block.
@@ -489,7 +528,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP",
     JSON.stringify({ state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -510,7 +549,7 @@ if (process.platform !== "win32") {
     "QUIESCENT, live intact",
     JSON.stringify({ state, hashes: h })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Receipt that expires AFTER planning must block the stop (plan §17.1 step 5).
@@ -527,7 +566,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP, no stop",
     JSON.stringify({ state, stopCount: s.service.stopCount, serviceState: s.service.state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Quiescence/admission evidence must be revalidated immediately before stop.
@@ -544,7 +583,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP, no stop",
     JSON.stringify({ state, stopCount: s.service.stopCount, serviceState: s.service.state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Release manifest tampered after planning: linkage recheck must block.
@@ -564,7 +603,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP, no stop",
     JSON.stringify({ state, stopCount: s.service.stopCount })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -587,7 +626,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP",
     JSON.stringify({ state, liveHash: h.live })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Durable intent required BEFORE mutation: a sync failure on the preserve
@@ -620,7 +659,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP, no rename",
     JSON.stringify({ state, hashes: h })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Directory fsync failure after the preserve rename: durability unknown ->
@@ -642,7 +681,7 @@ if (process.platform !== "win32") {
     "MANUAL -> resume QUIESCENT + live==baseline",
     JSON.stringify({ state, resumed, liveHash: treeSha(s.slots.liveDir) })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Journal result lost after the rename (runner crash): reconcile from FS.
@@ -670,7 +709,7 @@ if (process.platform !== "win32") {
     "MANUAL -> resume QUIESCENT + live==baseline",
     JSON.stringify({ state, resumed, liveHash: treeSha(s.slots.liveDir) })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Journal claims a state the filesystem contradicts -> FS wins.
@@ -698,7 +737,7 @@ if (process.platform !== "win32") {
     "BLOCKED_BEFORE_STOP, no start",
     JSON.stringify({ state, startCount: s.service.startCount })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -718,7 +757,7 @@ if (process.platform !== "win32") {
     "ROLLBACK_REQUIRED + backup preserved",
     JSON.stringify({ state, backupHash: s.hashes().backup })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Corruption between prepare and preserve: backup ends with a foreign tree.
@@ -736,7 +775,7 @@ if (process.platform !== "win32") {
     "MANUAL_RECOVERY_REQUIRED",
     JSON.stringify({ state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Override apply failure through the injected config adapter -> rollback.
@@ -755,7 +794,7 @@ if (process.platform !== "win32") {
     "ROLLBACK_REQUIRED",
     JSON.stringify({ state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -783,7 +822,7 @@ for (const [label, activate] of [
     "ROLLBACK_REQUIRED",
     JSON.stringify({ publish: r.publish, verify })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Non-cooperative start: bounded, no hang, no VERIFIED. Fault is activated
@@ -799,7 +838,7 @@ for (const [label, activate] of [
     "ROLLBACK_REQUIRED",
     JSON.stringify({ publish: r.publish, verify })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   const s = makeScenario();
@@ -815,7 +854,7 @@ for (const [label, activate] of [
     "ROLLBACK_REQUIRED within bound",
     JSON.stringify({ publish: r.publish, verify, elapsedMs: Math.round(elapsed) })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -841,7 +880,7 @@ for (const [label, activate] of [
     "ROLLED_BACK, overrides == {200, 25000}",
     JSON.stringify({ verify, rollback: rb, state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Prior: MAX_BYTES was UNSET -> rollback must leave it unset, not write a default.
@@ -863,7 +902,7 @@ for (const [label, activate] of [
     "ROLLED_BACK, MAX_BYTES unset",
     JSON.stringify({ verify, rollback: rb, state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Restore failure through the adapter -> MANUAL_RECOVERY_REQUIRED.
@@ -882,7 +921,7 @@ for (const [label, activate] of [
     "MANUAL_RECOVERY_REQUIRED",
     JSON.stringify({ verify, rollback: rb })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -906,7 +945,7 @@ for (const [label, activate] of [
     "ROLLED_BACK + evidence + restored live",
     JSON.stringify({ rollback: rb, evidenceSha, hashes: s.hashes() })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 for (const [label, setup] of [
   ["baseline start fails during rollback", (s) => { s.service.faults.startupFails = true; }],
@@ -925,7 +964,7 @@ for (const [label, setup] of [
     "MANUAL_RECOVERY_REQUIRED, bounded starts",
     JSON.stringify({ rollback: rb, startCount: s.service.startCount })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -943,7 +982,7 @@ for (const [label, setup] of [
     "MANUAL_RECOVERY_REQUIRED",
     JSON.stringify({ state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Unclear prior start: live holds the candidate, but the service may have
@@ -960,7 +999,7 @@ for (const [label, setup] of [
     "MANUAL_RECOVERY_REQUIRED",
     JSON.stringify({ state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Live slot empty, backup correct, never started: restore is the only move.
@@ -975,7 +1014,7 @@ for (const [label, setup] of [
     "QUIESCENT + live==baseline",
     JSON.stringify({ state, liveHash: treeSha(s.slots.liveDir) })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 {
   // Candidate published but provably never started: resume to CANDIDATE_PUBLISHED.
@@ -990,7 +1029,7 @@ for (const [label, setup] of [
     "CANDIDATE_PUBLISHED",
     JSON.stringify({ state })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,7 +1075,7 @@ for (const [label, setup] of [
     "COMPLETE, bounded starts, ordered trace, journal durable",
     JSON.stringify({ r, verifyAgain, startCount: s.service.startCount, stopCount, lockHeld, journalLines: journalLines.length, trace })
   );
-  fs.rmSync(s.base, { recursive: true, force: true });
+  cleanupScenario(s);
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,8 +1098,14 @@ for (const [label, setup] of [
     "3 durable records",
     JSON.stringify({ lines: onDisk.length })
   );
-  fs.rmSync(base, { recursive: true, force: true });
+  try {
+    j.close();
+  } catch {
+    /* journal close must not stop cleanup */
+  }
+  rmTreeRetry(base);
 }
+
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (process.env.CLC_EVIDENCE_DIR) {
