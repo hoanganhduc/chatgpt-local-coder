@@ -76,7 +76,16 @@ const unitScripts = [
   // practice however carefully it was written.
   "scripts/test-mcp-upstream.mjs",
   "scripts/test-activity-log.mjs",
+  // Fixtures F01-F23: limits/validation/truncation/metadata unit fixtures plus
+  // server-level instance identity checks (owned ports, no production env).
   "scripts/test-project-memory.mjs",
+  // REV-R04: deadline/lifecycle/port/cleanup failure paths for the shared
+  // server test harness (pending headers/body, early exit, spawn error,
+  // admin-port conflict, foreign HTTP 200, cleanup on failure).
+  "scripts/test-project-memory-harness.mjs",
+  // REV-R02 (F23): deployment state-machine fault-injection rehearsal against
+  // a fake service/supervisor adapter and test-owned slot directories.
+  "scripts/test-deployment-machine.mjs",
   "scripts/test-tool-profile.mjs",
   "scripts/test-tool-failure.mjs",
   "scripts/test-instructions.mjs",

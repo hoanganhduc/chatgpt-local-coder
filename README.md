@@ -462,6 +462,34 @@ chatgpt-local-coder secrets path
 `scripts/set-secrets.sh` does the same without the CLI installed. Full guide:
 [docs/credentials.md](docs/credentials.md).
 
+### Project memory
+
+At startup the host loads a project memory bundle (user file first, then
+`CLAUDE.md` / `.claude/CLAUDE.md` / `AGENTS.md` / `CLAUDE.local.md`, then
+unconditional rules) and injects it into every MCP session's instructions.
+
+The limits default to **500 lines per section** and **32768 bytes of content
+in total**, and each can be overridden:
+
+```bash
+PROJECT_MEMORY_MAX_LINES=500
+PROJECT_MEMORY_MAX_BYTES=32768
+```
+
+`PROJECT_MEMORY_MAX_BYTES` is the total UTF-8 byte size of the returned memory
+content — not the whole instructions and not a token count. The line limit
+applies per section after HTML comments are stripped and `@` imports expanded.
+Each key resolves independently as API options > environment > default, and an
+invalid value in the selected source fails the call
+(`ERR_PROJECT_MEMORY_LIMIT`) instead of falling back silently; a bad limit at
+startup exits before the listeners bind. Truncation cuts lines first then
+bytes, always on UTF-8 code point boundaries, and the health endpoint reports
+the effective limits, their sources and per-section
+`content_bytes` / `truncation_reasons`. `AUTO_MEMORY_MAX_*` keys are separate
+and unaffected.
+
+Full contract: [docs/project-memory.md](docs/project-memory.md).
+
 ## 🏗️ Architecture
 
 ```

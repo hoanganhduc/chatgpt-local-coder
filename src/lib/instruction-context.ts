@@ -86,20 +86,35 @@ export async function buildInstructionContext(
 }
 
 export function summarizeInstructionContext(ctx: InstructionContext): Record<string, unknown> {
+  const pm = ctx.projectMemory;
   return {
-    root: ctx.projectMemory.root,
-    workspace_roots: ctx.projectMemory.workspace_roots,
-    memory_files: ctx.projectMemory.sections.map((s) => ({
+    root: pm.root,
+    workspace_roots: pm.workspace_roots,
+    memory_contract_version: "clc.project-memory-summary.v1",
+    memory_limits: pm.memory_limits,
+    // Public boundary mapping: the bundle tracks sources with the internal
+    // camelCase key names; the public object must use exactly the same two
+    // keys as memory_limits (plan §14.1 / review REV-R01).
+    memory_limit_sources: {
+      max_lines_per_section: pm.memory_limit_sources.maxLines,
+      max_content_bytes: pm.memory_limit_sources.maxBytes,
+    },
+    memory_files: pm.sections.map((s) => ({
       path: s.path,
       kind: s.kind,
       truncated: s.truncated,
+      content_bytes: s.content_bytes,
+      truncation_reasons: s.truncation_reasons,
     })),
-    memory_bytes: ctx.projectMemory.total_bytes,
+    // Public summary exposes omission counts only; per-file omission details
+    // (bundle.omitted_sections) stay out of the unauthenticated health surface.
+    memory_omitted_counts: pm.memory_omitted_counts,
+    memory_bytes: pm.total_bytes,
     instruction_bytes: ctx.instructionBytes,
     git: ctx.git.is_repo
       ? { branch: ctx.git.branch, commits: ctx.git.recent_commits?.length ?? 0 }
       : { is_repo: false },
-    loaded_at: ctx.projectMemory.loaded_at,
+    loaded_at: pm.loaded_at,
     tool_profile: getChatGptToolProfile(),
   };
 }
