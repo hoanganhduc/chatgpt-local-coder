@@ -189,7 +189,22 @@ export function loadConfig(opts: LoadConfigOptions = {}): LoadedConfig {
   const projectRoot = preliminaryRoots[0] ? path.resolve(preliminaryRoots[0]) : cwd;
 
   const projectLayer = readJsonLayer("project", projectConfigFilePath(projectRoot));
-  if (projectLayer) layers.push(projectLayer);
+  if (projectLayer) {
+    const projectSkills = projectLayer.values.skills;
+    if (projectSkills?.scanHostOnly !== undefined) {
+      const lowerIsolation = userLayer?.values.skills?.scanHostOnly ?? true;
+      projectLayer.values = {
+        ...projectLayer.values,
+        skills: {
+          ...projectSkills,
+          // Isolation is monotonic across the untrusted project layer: a
+          // project may enable it, but cannot turn off a user/default `true`.
+          scanHostOnly: lowerIsolation || projectSkills.scanHostOnly,
+        },
+      };
+    }
+    layers.push(projectLayer);
+  }
 
   if (!opts.skipEnv) layers.push(envLayer());
   if (opts.overrides) layers.push({ id: "flags", values: opts.overrides });

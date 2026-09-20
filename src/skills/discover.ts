@@ -138,6 +138,15 @@ async function readSkill(file: string, root: SkillRoot, fallbackName: string): P
 async function collectFromRoot(root: SkillRoot): Promise<DiscoveredSkill[]> {
   const found: DiscoveredSkill[] = [];
 
+  if (root.origin === "user-host") {
+    try {
+      const rootStat = await fs.lstat(root.path);
+      if (rootStat.isSymbolicLink()) return found;
+    } catch {
+      return found;
+    }
+  }
+
   async function walk(dir: string, depth: number): Promise<void> {
     if (depth > MAX_DEPTH) return;
 
@@ -157,7 +166,8 @@ async function collectFromRoot(root: SkillRoot): Promise<DiscoveredSkill[]> {
 
       let hasSkillFile = false;
       try {
-        hasSkillFile = (await fs.stat(skillFile)).isFile();
+        const skillStat = root.origin === "user-host" ? await fs.lstat(skillFile) : await fs.stat(skillFile);
+        hasSkillFile = skillStat.isFile() && !skillStat.isSymbolicLink();
       } catch {
         hasSkillFile = false;
       }

@@ -247,7 +247,8 @@ await checkAsync("host-only mode makes the host root authoritative and excludes 
   );
   await writeSkill(explicit, "explicit-only", "name: explicit-only\ndescription: explicit config");
 
-  const result = await discoverSkills({
+  resetSkillRegistry();
+  const result = await loadSkillRegistry({
     workspaceRoots: [isolatedWorkspace],
     homeDir: isolatedHome,
     env: { AI_AGENTS_SKILLS_HOME: sharedHome },
@@ -263,9 +264,42 @@ await checkAsync("host-only mode makes the host root authoritative and excludes 
   assert(!result.roots.some((root) => root.origin === "user-claude"), "user Claude excluded");
   assert(!result.roots.some((root) => root.origin === "user-codex"), "user Codex excluded");
   assert(!result.roots.some((root) => root.path === path.resolve(imported)), "imported root excluded");
+  assert(result.shadowed.length > 0, "shared duplicates recorded as shadowed");
   assert(result.shadowed.every((item) => item.shadowedBy === kaggle?.file), "host copy shadows shared copies");
+  resetSkillRegistry();
 
   await fs.rm(isolatedTmp, { recursive: true, force: true });
+});
+
+await checkAsync("host-only mode refuses a linked host skill root", async () => {
+  const linkedTmp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-skills-linked-host-"));
+  const linkedHome = path.join(linkedTmp, "home");
+  const foreignRoot = path.join(linkedTmp, "foreign");
+  await writeSkill(foreignRoot, "foreign", "name: foreign\ndescription: must not load");
+  const hostParent = path.join(linkedHome, ".chatgpt-local-coder");
+  await fs.mkdir(hostParent, { recursive: true });
+  let linkAvailable = true;
+  try {
+    await fs.symlink(
+      foreignRoot,
+      path.join(hostParent, "skills"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
+  } catch {
+    linkAvailable = false;
+  }
+  if (linkAvailable) {
+    resetSkillRegistry();
+    const result = await loadSkillRegistry({
+      workspaceRoots: [],
+      homeDir: linkedHome,
+      env: emptyEnv,
+      scanHostOnly: true,
+    });
+    assert(!result.skills.some((skill) => skill.name === "foreign"), "linked host root was followed");
+  }
+  resetSkillRegistry();
+  await fs.rm(linkedTmp, { recursive: true, force: true });
 });
 
 await checkAsync("a skill with no description falls back to the first body line", async () => {
@@ -397,6 +431,24 @@ const escapeDir = await writeSkill(
   "escape",
   "name: escape\ndescription: entrypoint escapes its directory\nruntime: node\nentrypoint: ../echo-skill/run.mjs"
 );
+const junctionEscapeDir = await writeSkill(
+  execRoot,
+  "junction-escape",
+  "name: junction-escape\ndescription: entrypoint crosses a linked directory\nruntime: node\nentrypoint: linked/run.mjs"
+);
+const outsideEntrypoint = path.join(tmp, "outside-entrypoint");
+await fs.mkdir(outsideEntrypoint, { recursive: true });
+await fs.writeFile(path.join(outsideEntrypoint, "run.mjs"), 'process.stdout.write("escaped");\n', "utf-8");
+let junctionEscapeAvailable = true;
+try {
+  await fs.symlink(
+    outsideEntrypoint,
+    path.join(junctionEscapeDir, "linked"),
+    process.platform === "win32" ? "junction" : "dir"
+  );
+} catch {
+  junctionEscapeAvailable = false;
+}
 
 resetSkillRegistry();
 await loadSkillRegistry({ workspaceRoots: [], explicitRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
@@ -443,6 +495,14 @@ await checkAsync("an entrypoint outside the skill directory is refused", async (
   await runSkill("escape", { timeoutSec: 30 }).then(
     () => { throw new Error("should have been refused"); },
     (e) => assert(/resolves outside its own directory/.test(e.message), `message: ${e.message}`)
+  );
+});
+
+await checkAsync("an entrypoint through a directory link cannot escape the skill", async () => {
+  if (!junctionEscapeAvailable) return;
+  await runSkill("junction-escape", { timeoutSec: 30 }).then(
+    () => { throw new Error("should have been refused"); },
+    (e) => assert(/entrypoint not found/.test(e.message), `message: ${e.message}`)
   );
 });
 

@@ -240,7 +240,7 @@ export async function runDoctor(cwd = process.cwd()): Promise<DoctorReport> {
           id: "skills",
           level: "warn",
           message: "No skills discovered",
-          detail: `Searched: ${registry.roots.map((r) => r.path).join(", ") || "no roots"}`,
+          detail: `discovery=${config.skills.scanHostOnly ? "host-only" : "compatible"}; Searched: ${registry.roots.map((r) => r.path).join(", ") || "no roots"}`,
         }
   );
 

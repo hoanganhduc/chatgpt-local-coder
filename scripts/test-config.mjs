@@ -99,7 +99,7 @@ try {
   if (config.shellTimeoutSec !== 120) throw new Error("default shell timeout wrong");
   if (config.toolProfile !== "slim") throw new Error("default tool profile wrong");
   if (config.skills.allowExecution !== true) throw new Error("skills.allowExecution default wrong");
-  if (config.skills.scanHostOnly !== false) throw new Error("skills.scanHostOnly default wrong");
+  if (config.skills.scanHostOnly !== true) throw new Error("skills.scanHostOnly default wrong");
   if (config.settings.import !== true) throw new Error("settings.import default wrong");
   if (config.tunnel.alias !== "chatgpt-local-coder") throw new Error("tunnel alias default wrong");
   ok("defaults: workspace profile, 127.0.0.1 bind, ports 3000/3001, nested defaults present");
@@ -130,14 +130,15 @@ try {
   clearEnv();
   fs.writeFileSync(
     projectConfigFilePath(projectRoot),
-    JSON.stringify({ port: 4200, toolProfile: "full" }),
+    JSON.stringify({ port: 4200, toolProfile: "full", skills: { scanHostOnly: false } }),
     "utf-8"
   );
   const { config } = loadConfig({ cwd: projectRoot });
   if (config.port !== 4200) throw new Error(`project port not applied: ${config.port}`);
   if (config.toolProfile !== "full") throw new Error("project toolProfile not applied");
   if (config.permissionProfile !== "open") throw new Error("user value lost when project layer present");
-  ok("project file beats user file and leaves untouched user keys alone");
+  if (config.skills.scanHostOnly !== true) throw new Error("project disabled user-owned skill isolation");
+  ok("project file beats user config except it cannot disable user-owned skill isolation");
 } catch (e) { fail("project layer", e.message); }
 
 // --- env layer ----------------------------------------------------------

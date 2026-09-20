@@ -535,8 +535,9 @@ every root's `.agents/skills` is consulted before any root's `.claude/skills`.
 Duplicate paths are collapsed, so naming the same directory twice changes
 nothing.
 
-Set `skills.scanHostOnly` to `true` when this host must use its own installed
-skills instead of compatibility imports. In that mode the order is:
+`skills.scanHostOnly` defaults to `true` so this host uses its own installed
+skills instead of compatibility imports. A project config may enable this mode
+but cannot disable a user/default `true`. In host-only mode the order is:
 
 1. `~/.chatgpt-local-coder/skills`
 2. `<workspace>/.agents/skills`

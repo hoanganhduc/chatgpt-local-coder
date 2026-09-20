@@ -121,14 +121,20 @@ async function resolveEntrypoint(skill: DiscoveredSkill): Promise<string> {
     );
   }
 
+  let realBase: string;
+  let realEntrypoint: string;
   try {
-    const stat = await fs.stat(resolved);
+    [realBase, realEntrypoint] = await Promise.all([fs.realpath(base), fs.realpath(resolved)]);
+    if (realEntrypoint !== realBase && !realEntrypoint.startsWith(realBase + path.sep)) {
+      throw new Error("real path escapes the skill directory");
+    }
+    const stat = await fs.stat(realEntrypoint);
     if (!stat.isFile()) throw new Error("not a file");
   } catch {
     throw new Error(`skill "${skill.name}" entrypoint not found: ${resolved}`);
   }
 
-  return resolved;
+  return realEntrypoint;
 }
 
 export async function runSkill(

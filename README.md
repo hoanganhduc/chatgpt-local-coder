@@ -388,9 +388,12 @@ shadows a global one — see
 [docs/cross-platform.md](docs/cross-platform.md#6-skills-and-symlinks) for the
 full precedence list.
 
-For a self-contained target install, set `skills.scanHostOnly` to `true`. This
-keeps the host's own `~/.chatgpt-local-coder/skills` authoritative while still
-allowing shared and explicitly configured fallback roots.
+Self-contained target discovery is the default: `skills.scanHostOnly` is `true`.
+This keeps the host's own `~/.chatgpt-local-coder/skills` authoritative while
+still allowing shared and explicitly configured fallback roots. A project file
+may enable this isolation but cannot disable a user/default `true`; only the
+user config or a trusted command-line override can opt back into compatibility
+discovery.
 
 ## ⚙️ Configuration
 
@@ -401,7 +404,7 @@ over the user config for that workspace.
 | Key | Default | Description |
 |---|---|---|
 | `workspaceRoots` | `[cwd]` | Roots the host may write in under the `workspace` profile |
-| `skills.scanHostOnly` | `false` | Prefer this host's own skill root and omit automatically imported skill roots from other agents |
+| `skills.scanHostOnly` | `true` | Prefer this host's own skill root and omit automatically imported skill roots from other agents |
 | `permissionProfile` | `workspace` | `workspace`, `open`, or `readonly` |
 | `bindHost` | `127.0.0.1` | Listener address. Change only if you know why |
 | `port` / `adminPort` | `3000` / `3001` | MCP and admin ports |
