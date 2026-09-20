@@ -204,7 +204,6 @@ export async function runDoctor(cwd = process.cwd()): Promise<DoctorReport> {
     workspaceRoots: config.workspaceRoots,
     sources: config.settings.sources,
     enabled: config.settings.import,
-    host: { skillRoots: config.skills.roots },
   });
   const badSources = settings.sources.filter((s) => !s.ok);
   const okSources = settings.sources.filter((s) => s.ok);
@@ -220,7 +219,9 @@ export async function runDoctor(cwd = process.cwd()): Promise<DoctorReport> {
 
   const registry = await loadSkillRegistry({
     workspaceRoots: config.workspaceRoots,
-    extraRoots: [...settings.skillRoots, ...config.skills.roots],
+    importedRoots: settings.skillRoots,
+    explicitRoots: config.skills.roots,
+    scanHostOnly: config.skills.scanHostOnly,
     enabled: config.skills.enabled,
     disabled: config.skills.disabled,
   });
@@ -230,7 +231,10 @@ export async function runDoctor(cwd = process.cwd()): Promise<DoctorReport> {
           id: "skills",
           level: "ok",
           message: `Skills: ${registry.skills.length} from ${registry.roots.length} root(s)`,
-          detail: registry.shadowed.length ? `${registry.shadowed.length} shadowed by an earlier root` : undefined,
+          detail: [
+            `discovery=${config.skills.scanHostOnly ? "host-only" : "compatible"}`,
+            registry.shadowed.length ? `${registry.shadowed.length} shadowed by an earlier root` : "",
+          ].filter(Boolean).join("; "),
         }
       : {
           id: "skills",

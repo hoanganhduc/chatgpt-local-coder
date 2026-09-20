@@ -10,6 +10,7 @@ const skillsSchema = z.object({
   roots: z.array(z.string()).default([]),
   enabled: z.array(z.string()).default([]),
   disabled: z.array(z.string()).default([]),
+  scanHostOnly: z.boolean().default(false),
   allowExecution: z.boolean().default(true),
   maxRuntimeSec: z.number().int().positive().default(300),
 });

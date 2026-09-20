@@ -99,6 +99,7 @@ try {
   if (config.shellTimeoutSec !== 120) throw new Error("default shell timeout wrong");
   if (config.toolProfile !== "slim") throw new Error("default tool profile wrong");
   if (config.skills.allowExecution !== true) throw new Error("skills.allowExecution default wrong");
+  if (config.skills.scanHostOnly !== false) throw new Error("skills.scanHostOnly default wrong");
   if (config.settings.import !== true) throw new Error("settings.import default wrong");
   if (config.tunnel.alias !== "chatgpt-local-coder") throw new Error("tunnel alias default wrong");
   ok("defaults: workspace profile, 127.0.0.1 bind, ports 3000/3001, nested defaults present");
@@ -112,13 +113,14 @@ try {
 // --- user file layer ----------------------------------------------------
 try {
   clearEnv();
-  const written = writeUserConfig({ port: 4100, permissionProfile: "open", skills: { maxRuntimeSec: 45 } });
+  const written = writeUserConfig({ port: 4100, permissionProfile: "open", skills: { maxRuntimeSec: 45, scanHostOnly: true } });
   if (written !== configFilePath()) throw new Error("writeUserConfig wrote elsewhere");
 
   const { config } = loadConfig({ cwd: projectRoot });
   if (config.port !== 4100) throw new Error(`user port not applied: ${config.port}`);
   if (config.permissionProfile !== "open") throw new Error("user profile not applied");
   if (config.skills.maxRuntimeSec !== 45) throw new Error("nested user value not applied");
+  if (config.skills.scanHostOnly !== true) throw new Error("skills.scanHostOnly user value not applied");
   if (config.skills.allowExecution !== true) throw new Error("sibling nested default lost on partial write");
   ok("user file overrides defaults and a partial nested object keeps its siblings");
 } catch (e) { fail("user layer", e.message); }

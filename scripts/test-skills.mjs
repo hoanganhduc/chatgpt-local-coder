@@ -217,12 +217,63 @@ await checkAsync("AI_AGENTS_SKILLS_HOME outranks the user home roots", async () 
   assert(found.root.origin === "skills-home", `origin: ${found.root.origin}`);
 });
 
+await checkAsync("host-only mode makes the host root authoritative and excludes imported roots", async () => {
+  const isolatedTmp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-skills-isolated-"));
+  const isolatedHome = path.join(isolatedTmp, "home");
+  const isolatedWorkspace = path.join(isolatedTmp, "workspace");
+  const imported = path.join(isolatedTmp, "imported");
+  const explicit = path.join(isolatedTmp, "explicit");
+  const sharedHome = path.join(isolatedTmp, "shared");
+
+  await writeSkill(
+    path.join(isolatedHome, ".chatgpt-local-coder", "skills"),
+    "kaggle-research-compute",
+    "name: kaggle-research-compute\ndescription: host-owned"
+  );
+  await writeSkill(
+    path.join(isolatedWorkspace, ".agents", "skills"),
+    "kaggle-research-compute",
+    "name: kaggle-research-compute\ndescription: shared workspace"
+  );
+  await writeSkill(
+    sharedHome,
+    "kaggle-research-compute",
+    "name: kaggle-research-compute\ndescription: shared env"
+  );
+  await writeSkill(
+    imported,
+    "kaggle-research-compute",
+    "name: kaggle-research-compute\ndescription: imported agent"
+  );
+  await writeSkill(explicit, "explicit-only", "name: explicit-only\ndescription: explicit config");
+
+  const result = await discoverSkills({
+    workspaceRoots: [isolatedWorkspace],
+    homeDir: isolatedHome,
+    env: { AI_AGENTS_SKILLS_HOME: sharedHome },
+    importedRoots: [imported],
+    explicitRoots: [explicit],
+    scanHostOnly: true,
+  });
+  const kaggle = result.skills.find((skill) => skill.name === "kaggle-research-compute");
+  assert(kaggle?.root.origin === "user-host", `origin: ${kaggle?.root.origin}`);
+  assert(kaggle?.description === "host-owned", `description: ${kaggle?.description}`);
+  assert(result.skills.some((skill) => skill.name === "explicit-only"), "explicit root retained");
+  assert(!result.roots.some((root) => root.origin === "workspace-claude"), "workspace Claude excluded");
+  assert(!result.roots.some((root) => root.origin === "user-claude"), "user Claude excluded");
+  assert(!result.roots.some((root) => root.origin === "user-codex"), "user Codex excluded");
+  assert(!result.roots.some((root) => root.path === path.resolve(imported)), "imported root excluded");
+  assert(result.shadowed.every((item) => item.shadowedBy === kaggle?.file), "host copy shadows shared copies");
+
+  await fs.rm(isolatedTmp, { recursive: true, force: true });
+});
+
 await checkAsync("a skill with no description falls back to the first body line", async () => {
   const root = path.join(tmp, "nodesc");
   await writeSkill(root, "bare", "name: bare", "# Heading\n\nFirst real line.");
   const { skills } = await discoverSkills({
     workspaceRoots: [],
-    extraRoots: [root],
+    explicitRoots: [root],
     homeDir: path.join(tmp, "nonexistent-home"),
     env: emptyEnv,
   });
@@ -348,7 +399,7 @@ const escapeDir = await writeSkill(
 );
 
 resetSkillRegistry();
-await loadSkillRegistry({ workspaceRoots: [], extraRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
+await loadSkillRegistry({ workspaceRoots: [], explicitRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
 
 await checkAsync("skill_run returns the entrypoint's stdout", async () => {
   const result = await runSkill("echo-skill", { args: ["a", "b"], timeoutSec: 30 });
@@ -380,7 +431,7 @@ await checkAsync("skill_run refuses a documentation-only skill and points at ski
 await checkAsync("skill_run refuses an unrecognised runtime", async () => {
   await writeSkill(execRoot, "ruby-skill", "name: ruby-skill\ndescription: unsupported runtime\nruntime: ruby\nentrypoint: run.rb");
   resetSkillRegistry();
-  await loadSkillRegistry({ workspaceRoots: [], extraRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
+  await loadSkillRegistry({ workspaceRoots: [], explicitRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
 
   await runSkill("ruby-skill", { timeoutSec: 30 }).then(
     () => { throw new Error("should have been refused"); },
@@ -418,7 +469,7 @@ await checkAsync("a bash skill uses Git Bash directly on native Windows", async 
   await fs.writeFile(path.join(bashDir, "run.sh"), 'echo "from bash"\n', "utf-8");
 
   resetSkillRegistry();
-  await loadSkillRegistry({ workspaceRoots: [], extraRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
+  await loadSkillRegistry({ workspaceRoots: [], explicitRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
 
   // A native Windows host may expose the WSL launcher as System32\bash.exe
   // before Git Bash. Skill entrypoints are native Windows paths, so the
@@ -468,7 +519,7 @@ await checkAsync("skill_run reports a timeout rather than hanging", async () => 
   await fs.writeFile(path.join(slowDir, "run.mjs"), "setTimeout(() => {}, 30000);\n", "utf-8");
 
   resetSkillRegistry();
-  await loadSkillRegistry({ workspaceRoots: [], extraRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
+  await loadSkillRegistry({ workspaceRoots: [], explicitRoots: [execRoot], homeDir: path.join(tmp, "nonexistent-home"), env: emptyEnv });
 
   const result = await runSkill("slow-skill", { timeoutSec: 1 });
   assert(result.timedOut === true, "timedOut flag set");

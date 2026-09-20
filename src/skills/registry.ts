@@ -20,7 +20,9 @@ const DESCRIPTION_CHARS = 200;
 
 export interface SkillRegistryOptions {
   workspaceRoots: string[];
-  extraRoots?: string[];
+  importedRoots?: string[];
+  explicitRoots?: string[];
+  scanHostOnly?: boolean;
   /** Allowlist; empty means "all discovered skills". */
   enabled?: string[];
   /** Denylist, applied after the allowlist. */
@@ -69,7 +71,9 @@ function applyFilters(
 export async function loadSkillRegistry(opts: SkillRegistryOptions): Promise<SkillRegistry> {
   const result = await discoverSkills({
     workspaceRoots: opts.workspaceRoots,
-    extraRoots: opts.extraRoots,
+    importedRoots: opts.importedRoots,
+    explicitRoots: opts.explicitRoots,
+    scanHostOnly: opts.scanHostOnly,
     env: opts.env,
     homeDir: opts.homeDir,
   });

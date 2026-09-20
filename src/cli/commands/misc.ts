@@ -57,11 +57,12 @@ async function registryFor(cwd: string) {
     workspaceRoots: config.workspaceRoots,
     sources: config.settings.sources,
     enabled: config.settings.import,
-    host: { skillRoots: config.skills.roots },
   });
   const registry = await loadSkillRegistry({
     workspaceRoots: config.workspaceRoots,
-    extraRoots: [...settings.skillRoots, ...config.skills.roots],
+    importedRoots: settings.skillRoots,
+    explicitRoots: config.skills.roots,
+    scanHostOnly: config.skills.scanHostOnly,
     enabled: config.skills.enabled,
     disabled: config.skills.disabled,
   });

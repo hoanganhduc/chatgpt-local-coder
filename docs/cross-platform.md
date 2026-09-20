@@ -535,6 +535,20 @@ every root's `.agents/skills` is consulted before any root's `.claude/skills`.
 Duplicate paths are collapsed, so naming the same directory twice changes
 nothing.
 
+Set `skills.scanHostOnly` to `true` when this host must use its own installed
+skills instead of compatibility imports. In that mode the order is:
+
+1. `~/.chatgpt-local-coder/skills`
+2. `<workspace>/.agents/skills`
+3. `$AI_AGENTS_SKILLS_HOME`
+4. `~/ai-agents-skills/canonical/skills`
+5. explicit roots from `skills.roots`
+
+Claude, Codex, Grok, and OpenCode settings continue to contribute permissions,
+hooks, MCP servers, and agents; only their automatically imported skill roots
+are omitted. The host-owned root comes first so a managed local skill cannot be
+shadowed by a compatibility source.
+
 `chatgpt-local-coder skills list --json` shows which root each skill came from
 and what was shadowed.
 

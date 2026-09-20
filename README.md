@@ -378,11 +378,19 @@ chatgpt-local-coder skills read sagemath
 chatgpt-local-coder skills run sagemath -- --help
 ```
 
+`skills run` applies only to skills that declare both `runtime` and
+`entrypoint`. Documentation-only skills are loaded with `skills read`; follow
+their instructions with the normal host tools such as `run_command`.
+
 The host also reads skills installed for other agents. Roots are searched in a
 fixed order and the first root to define a `name` wins, so a project-local skill
 shadows a global one — see
 [docs/cross-platform.md](docs/cross-platform.md#6-skills-and-symlinks) for the
 full precedence list.
+
+For a self-contained target install, set `skills.scanHostOnly` to `true`. This
+keeps the host's own `~/.chatgpt-local-coder/skills` authoritative while still
+allowing shared and explicitly configured fallback roots.
 
 ## ⚙️ Configuration
 
@@ -393,6 +401,7 @@ over the user config for that workspace.
 | Key | Default | Description |
 |---|---|---|
 | `workspaceRoots` | `[cwd]` | Roots the host may write in under the `workspace` profile |
+| `skills.scanHostOnly` | `false` | Prefer this host's own skill root and omit automatically imported skill roots from other agents |
 | `permissionProfile` | `workspace` | `workspace`, `open`, or `readonly` |
 | `bindHost` | `127.0.0.1` | Listener address. Change only if you know why |
 | `port` / `adminPort` | `3000` / `3001` | MCP and admin ports |

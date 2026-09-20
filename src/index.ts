@@ -81,7 +81,6 @@ const settings = await loadSettings({
   workspaceRoots,
   sources: config.settings.sources,
   enabled: config.settings.import,
-  host: { skillRoots: config.skills.roots },
 });
 setImportedRuleCheck(checkImportedRules);
 
@@ -94,7 +93,9 @@ if (config.hooks.enabled) registerPostEditHook();
 // one registry rather than re-walking every root per session.
 const skillRegistry = await loadSkillRegistry({
   workspaceRoots,
-  extraRoots: [...settings.skillRoots, ...config.skills.roots],
+  importedRoots: settings.skillRoots,
+  explicitRoots: config.skills.roots,
+  scanHostOnly: config.skills.scanHostOnly,
   enabled: config.skills.enabled,
   disabled: config.skills.disabled,
 });

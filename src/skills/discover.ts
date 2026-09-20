@@ -57,8 +57,12 @@ export interface DiscoveryResult {
 
 export interface DiscoverOptions {
   workspaceRoots: string[];
-  /** Extra roots from `skills.roots` in host config. */
-  extraRoots?: string[];
+  /** Skill roots imported from other agent settings. */
+  importedRoots?: string[];
+  /** Explicit roots from `skills.roots` in this host's config. */
+  explicitRoots?: string[];
+  /** Restrict automatic discovery to this host and shared roots. */
+  scanHostOnly?: boolean;
   /** Overrides `process.env` lookups; used by tests. */
   env?: NodeJS.ProcessEnv;
   /** Overrides `os.homedir()`; used by tests. */
@@ -83,18 +87,27 @@ export function skillRootCandidates(opts: DiscoverOptions): SkillRoot[] {
     roots.push({ path: resolved, origin, rank: rank++ });
   };
 
-  for (const ws of opts.workspaceRoots) push(path.join(ws, ".agents", "skills"), "workspace-agents");
-  for (const ws of opts.workspaceRoots) push(path.join(ws, ".claude", "skills"), "workspace-claude");
+  if (opts.scanHostOnly) {
+    // The host-owned root is authoritative in isolated mode. Shared roots are
+    // fallbacks, never a way for another target to shadow a managed host skill.
+    push(path.join(home, ".chatgpt-local-coder", "skills"), "user-host");
+    for (const ws of opts.workspaceRoots) push(path.join(ws, ".agents", "skills"), "workspace-agents");
+    push(env.AI_AGENTS_SKILLS_HOME?.trim() || undefined, "skills-home");
+    push(path.join(home, "ai-agents-skills", "canonical", "skills"), "canonical");
+  } else {
+    for (const ws of opts.workspaceRoots) push(path.join(ws, ".agents", "skills"), "workspace-agents");
+    for (const ws of opts.workspaceRoots) push(path.join(ws, ".claude", "skills"), "workspace-claude");
 
-  push(env.AI_AGENTS_SKILLS_HOME?.trim() || undefined, "skills-home");
-  push(path.join(home, ".claude", "skills"), "user-claude");
-  // This host's own home, the directory `ai-agents-skills` installs into when
-  // the `chatgpt-local-coder` target is selected.
-  push(path.join(home, ".chatgpt-local-coder", "skills"), "user-host");
-  push(path.join(home, ".codex", "skills"), "user-codex");
-  push(path.join(home, "ai-agents-skills", "canonical", "skills"), "canonical");
+    push(env.AI_AGENTS_SKILLS_HOME?.trim() || undefined, "skills-home");
+    push(path.join(home, ".claude", "skills"), "user-claude");
+    push(path.join(home, ".chatgpt-local-coder", "skills"), "user-host");
+    push(path.join(home, ".codex", "skills"), "user-codex");
+    push(path.join(home, "ai-agents-skills", "canonical", "skills"), "canonical");
 
-  for (const extra of opts.extraRoots ?? []) push(extra, "config");
+    for (const imported of opts.importedRoots ?? []) push(imported, "config");
+  }
+
+  for (const explicit of opts.explicitRoots ?? []) push(explicit, "config");
 
   return roots;
 }
