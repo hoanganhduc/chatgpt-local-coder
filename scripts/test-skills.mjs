@@ -302,6 +302,43 @@ await checkAsync("host-only mode refuses a linked host skill root", async () => 
   await fs.rm(linkedTmp, { recursive: true, force: true });
 });
 
+await checkAsync("host-only mode refuses a linked host-root parent", async () => {
+  const linkedTmp = await fs.mkdtemp(path.join(os.tmpdir(), "clc-skills-linked-parent-"));
+  const linkedHome = path.join(linkedTmp, "home");
+  const foreignParent = path.join(linkedTmp, "foreign-parent");
+  await writeSkill(
+    path.join(foreignParent, "skills"),
+    "foreign-parent-skill",
+    "name: foreign-parent-skill\ndescription: must not load"
+  );
+  await fs.mkdir(linkedHome, { recursive: true });
+  let linkAvailable = true;
+  try {
+    await fs.symlink(
+      foreignParent,
+      path.join(linkedHome, ".chatgpt-local-coder"),
+      process.platform === "win32" ? "junction" : "dir"
+    );
+  } catch {
+    linkAvailable = false;
+  }
+  if (linkAvailable) {
+    resetSkillRegistry();
+    const result = await loadSkillRegistry({
+      workspaceRoots: [],
+      homeDir: linkedHome,
+      env: emptyEnv,
+      scanHostOnly: true,
+    });
+    assert(
+      !result.skills.some((skill) => skill.name === "foreign-parent-skill"),
+      "linked host parent was followed"
+    );
+  }
+  resetSkillRegistry();
+  await fs.rm(linkedTmp, { recursive: true, force: true });
+});
+
 await checkAsync("a skill with no description falls back to the first body line", async () => {
   const root = path.join(tmp, "nodesc");
   await writeSkill(root, "bare", "name: bare", "# Heading\n\nFirst real line.");

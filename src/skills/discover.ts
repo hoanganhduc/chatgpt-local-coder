@@ -140,8 +140,10 @@ async function collectFromRoot(root: SkillRoot): Promise<DiscoveredSkill[]> {
 
   if (root.origin === "user-host") {
     try {
-      const rootStat = await fs.lstat(root.path);
-      if (rootStat.isSymbolicLink()) return found;
+      for (const candidate of [path.dirname(root.path), root.path]) {
+        const stat = await fs.lstat(candidate);
+        if (stat.isSymbolicLink()) return found;
+      }
     } catch {
       return found;
     }
@@ -166,6 +168,7 @@ async function collectFromRoot(root: SkillRoot): Promise<DiscoveredSkill[]> {
 
       let hasSkillFile = false;
       try {
+        if (root.origin === "user-host" && (await fs.lstat(full)).isSymbolicLink()) continue;
         const skillStat = root.origin === "user-host" ? await fs.lstat(skillFile) : await fs.stat(skillFile);
         hasSkillFile = skillStat.isFile() && !skillStat.isSymbolicLink();
       } catch {

@@ -43,7 +43,7 @@ export async function buildInstructionContext(
   // builds instructions without having gone through that path.
   const registry = isSkillRegistryLoaded()
     ? getSkillRegistry()
-    : await loadSkillRegistry({ workspaceRoots: opts.workspaceRoots });
+    : await loadSkillRegistry({ workspaceRoots: opts.workspaceRoots, scanHostOnly: true });
 
   const [projectMemory, git, autoMemory] = await Promise.all([
     loadProjectMemory(opts.workspaceRoot, { workspaceRoots: opts.workspaceRoots }),
